@@ -401,7 +401,7 @@ if (inherits(distance_matrix_gower, "dist")) {
         }
 
         # --- Extract principal coordinates ---
-        num_axes_to_extract = 5 # Or however many you need downstream
+        num_axes_to_extract = 5 # Adjust as needed
         if (!is.null(pcoa_result_ade4$li) && ncol(pcoa_result_ade4$li) >= num_axes_to_extract) {
 
             # Select first N axes from the $li dataframe

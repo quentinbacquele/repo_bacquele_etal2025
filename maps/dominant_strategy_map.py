@@ -132,7 +132,7 @@ def create_dominant_strategy_map_styled( # Renamed for clarity
     ax.add_feature(land, edgecolor='none', facecolor=land_color, zorder=0)
     ax.add_feature(ocean, edgecolor='none', facecolor=ocean_color, zorder=0)
     # NOTE: Original script didn't add coastlines explicitly AFTER adding land/ocean
-    # If you want coastlines ON TOP of the data/land, add them later with higher zorder
+    # To add coastlines ON TOP of the data/land, add them later with higher zorder
     # ax.coastlines(linewidth=0.5, color="#666666", zorder=3) # Example if needed
 
     # --- Plotting the Categorical Data using Raster Approach (like original) ---
@@ -160,7 +160,7 @@ def create_dominant_strategy_map_styled( # Renamed for clarity
     for _, row in data_to_plot.iterrows():
         # Calculate grid indices based on centroid coordinates
         # Adding 0.5 assumes centroids are near cell centers, flooring maps to bottom-left corner index
-        # Adjust if your grid coordinates represent something else (e.g., corners)
+        # Adjust if grid coordinates represent something else (e.g., corners)
         i = int(np.floor(row['grid_lon'] + 180))  # Lon index (0-359)
         j = int(np.floor(row['grid_lat'] + 90))   # Lat index (0-179)
         

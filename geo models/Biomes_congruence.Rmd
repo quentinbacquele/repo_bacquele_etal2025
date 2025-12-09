@@ -29,7 +29,7 @@ dat0 <- read_csv("output/biomes/geographic_model_data_with_biomes.csv",
 ```
 ```{r}
 id_col <- "grid_id"                                # spatial id string
-# SES count columns you want to model (8 syndromes)
+# SES count columns to model (8 syndromes)
 response_cols <- paste0("ses_count_gt5_", 0:7)
 
 # Sanity check
@@ -81,7 +81,7 @@ dat4 <- dat3 %>%
 # --- Final tidy 'dat' for the INLA scaffold ---
 dat <- dat4 %>%
   arrange(lon, lat) %>%
-  mutate(idx = row_number()) %>%   # useful if you later run BYM2
+  mutate(idx = row_number()) %>%   # useful for BYM2
   relocate(lon, lat, BIOME_NUM, idx)
 
 dat$BIOME_NUM = as.factor(dat$BIOME_NUM)
@@ -145,7 +145,7 @@ set.seed(1)
 
 coords <- as.matrix(dat[, c("lon","lat")])
 
-# Mesh & SPDE (copying the priors from your reference code)
+# Mesh & SPDE
 mesh <- inla.mesh.2d(
   loc = coords,
   max.edge = c(2, 4),

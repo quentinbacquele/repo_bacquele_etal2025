@@ -46,7 +46,7 @@ sumtrees_command = [
 
     # Consensus definition options
     # '-f 0.5' is usually the default for majority rule, only needed if changing
-    # Add '-f 0.5' here if you want to be explicit or use a different value, e.g., '-f 0.95'
+    # Add '-f 0.5' here to be explicit or use a different value, e.g., '-f 0.95'
     # '-f', '0.5', # Example if explicitly setting 50%
 
     # Branch length options - UPDATED FLAG
@@ -95,8 +95,8 @@ except FileNotFoundError:
     python_executable_dir = os.path.dirname(sys.executable)
     print(f"\nError: Could not find the command '{sumtrees_executable}'.")
     print("Please ensure DendroPy is installed correctly (`pip install dendropy`)")
-    print("and that 'sumtrees.py' is in your system's PATH.")
-    print(f"(Your Python executable is in: {python_executable_dir})")
+    print("and that 'sumtrees.py' is in the system's PATH.")
+    print(f"(Python executable is in: {python_executable_dir})")
     print(f"If needed, manually set the full path to 'sumtrees.py' in the 'sumtrees_executable' variable within this script.")
     sys.exit(1)
 except subprocess.CalledProcessError as e:
