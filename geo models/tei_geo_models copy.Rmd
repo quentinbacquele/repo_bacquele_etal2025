@@ -1,0 +1,2988 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+---
+
+
+```{r}
+library(dplyr)
+library(tidyr) # For drop_na and pivot_longer
+library(ggplot2)
+library(INLA)
+library(purrr) # For map functions
+library(tibble)
+library(gt)    # For creating nice tables
+library(stringr) # For string manipulation (if needed for grid_id)
+library(sf)      # For handling spatial objects
+library(spdep)   # For defining neighbors and exporting graph
+library(readr)
+```
+```{r}
+set.seed(123)
+```
+
+
+```{r}
+setwd("/Users/quentinbacquele/Desktop/PhD/analysis/geography/climate/")
+```
+
+
+```{r}
+# --- load ----------
+dat <- read_csv("output/tei/combined_tei_and_environmental_data.csv", na = c("", "NA"))
+ses_mpd <- read_csv("output/traits_geo_model/spatial_ses_mpd.csv", na = c("", "NA"))
+```
+```{r}
+library(dplyr)
+# --- Parse ses_mpd grid_id -> lon/lat, then merge into dat ---
+
+# Required input column in ses_mpd
+id_col <- "grid_id"
+
+# Regex pattern 
+coord_pattern <- "^lon(n?)(\\d+)p.*_lat(n?)(\\d+)p.*$"
+
+# Apply the regex and extract components
+extracted_coords <- str_match(ses_mpd[[id_col]], coord_pattern)
+
+# Warn if some IDs don't match
+if (any(is.na(extracted_coords[, 1]))) {
+  warning("Coordinate pattern did not match for some ses_mpd grid_id values.")
+  # print(ses_mpd[[id_col]][is.na(extracted_coords[,1])])
+}
+
+# Convert to numeric coordinates with correct sign
+ses_mpd_coords <- ses_mpd %>%
+  mutate(
+    lon_sign = ifelse(!is.na(extracted_coords[, 2]) & extracted_coords[, 2] == "n", -1, 1),
+    lon_val  = as.numeric(extracted_coords[, 3]),
+    lon      = lon_sign * lon_val,
+    lat_sign = ifelse(!is.na(extracted_coords[, 4]) & extracted_coords[, 4] == "n", -1, 1),
+    lat_val  = as.numeric(extracted_coords[, 5]),
+    lat      = lat_sign * lat_val,
+    ses_mpd  = as.numeric(ses_mpd) 
+  ) %>%
+  dplyr::select(lon, lat, ses_mpd) %>%
+  # In case multiple grid_ids collapse to the same cell, average them
+  group_by(lon, lat) %>%
+  summarise(ses_mpd = mean(ses_mpd, na.rm = TRUE), .groups = "drop")
+
+# Left-join into the analysis dataset by lon/lat
+dat <- dat %>%
+  left_join(ses_mpd_coords, by = c("lon", "lat"))
+
+# Quick coverage check
+cat("ses_mpd available for", sum(!is.na(dat$ses_mpd)), "of", nrow(dat), "rows.\n")
+```
+
+
+```{r}
+# --- Define Columns ---
+dat <- dplyr::rename(dat, TEI = transmission_efficiency_weighted)
+tei_col <- "TEI"
+
+# Use separate vegetation predictors (no composite index)
+predictor_cols <- c("rh_mean", "temp_mean", "ruggedness", "hfp",
+                    "ndvi_mean", "vegetation_height", "ses_mpd")
+
+# Raw columns needed
+veg_raw_cols <- c("ndvi_mean", "veg_height_avg")
+other_raw_predictors <- c("rh_mean", "temp_mean", "ruggedness", "hfp")
+all_raw_predictors_initially <- c(other_raw_predictors, veg_raw_cols, "ses_mpd", tei_col)
+
+```
+
+
+```{r}
+# --- Data Cleaning and Final Selection (no vegetation_index) ---
+
+stopifnot(all(c("lon","lat") %in% names(dat)))
+
+dat_processed <- dat %>%
+  dplyr::select(lon, lat, dplyr::all_of(all_raw_predictors_initially)) %>%
+  dplyr::mutate(dplyr::across(dplyr::all_of(c(other_raw_predictors, veg_raw_cols, "ses_mpd", tei_col)),
+                              as.numeric)) %>%
+  # Create requested "vegetation_height" from raw veg_height_avg
+  dplyr::mutate(vegetation_height = veg_height_avg) %>%
+  dplyr::select(lon, lat, dplyr::all_of(tei_col),
+                rh_mean, temp_mean, ruggedness, hfp,
+                ndvi_mean, vegetation_height, ses_mpd)
+
+dat <- dat_processed %>%
+  tidyr::drop_na() %>%
+  dplyr::arrange(lon, lat) %>%
+  dplyr::mutate(idx = dplyr::row_number())
+
+print(paste("Remaining rows:", nrow(dat)))
+print("Summary of vegetation predictors:")
+print(summary(dat[, c("ndvi_mean", "vegetation_height")]))
+```
+
+```{r}
+# --- Visualize TEI Distribution ---
+plot_tei <- ggplot(dat, aes(x = .data[[tei_col]])) +
+  geom_histogram(bins = 30, fill = "steelblue", alpha = 0.8) +
+  labs(title = "Distribution of TEI", x = "TEI", y = "Frequency") +
+  theme_minimal()
+print(plot_tei)
+```
+
+```{r}
+# --- Step 1a: Find Islands in the ORIGINAL data ---
+cat("--- Running initial neighbor search to identify islands --- \n")
+
+dat_original <- dat 
+
+# Verify required columns exist in dat_original
+if (!all(c("lon", "lat", "idx") %in% names(dat_original))) {
+  stop("Original data frame must contain 'lon', 'lat', and 'idx' columns.")
+}
+if (!all(dat_original$idx == 1:nrow(dat_original))) {
+   warning("Re-creating sequential 'idx' in original data copy.")
+   dat_original <- dat_original %>% arrange(idx) %>% mutate(idx = 1:n())
+}
+
+
+# --- Run the neighbor finding loop (same as before) ---
+coord_map_orig <- setNames(as.list(dat_original$idx), paste(round(dat_original$lon, 5), round(dat_original$lat, 5), sep = "_"))
+neighbours_list_orig <- vector("list", nrow(dat_original))
+max_lon_orig <- 179
+min_lon_orig <- -180
+
+cat("Finding neighbors on original data (to identify islands)...\n")
+for (i in 1:nrow(dat_original)) {
+  current_idx <- dat_original$idx[i]
+  current_lon <- dat_original$lon[i]
+  current_lat <- dat_original$lat[i]
+  neighbor_indices <- integer(0)
+  relative_coords <- list(c(0, 1), c(0, -1), c(1, 0), c(-1, 0), c(1, 1), c(1, -1), c(-1, 1), c(-1, -1))
+  for (dcoords in relative_coords) {
+    dlon <- dcoords[1]; dlat <- dcoords[2]
+    target_lon <- current_lon + dlon; target_lat <- current_lat + dlat
+    if (target_lon > max_lon_orig) { target_lon <- min_lon_orig }
+    else if (target_lon < min_lon_orig) { target_lon <- max_lon_orig }
+    target_key <- paste(round(target_lon, 5), round(target_lat, 5), sep = "_")
+    if (target_key %in% names(coord_map_orig)) {
+      neighbor_indices <- c(neighbor_indices, coord_map_orig[[target_key]])
+    }
+  }
+  # Store based on the original index 'i' which matches current_idx here
+  neighbours_list_orig[[i]] <- sort(unique(as.integer(neighbor_indices)))
+   if (i %% 5000 == 0) { cat("Processed", i, "of", nrow(dat_original), "cells...\n") }
+}
+cat("Finished initial neighbor search.\n")
+
+# --- Identify island indices (based on the original index) ---
+island_indices_orig <- which(sapply(neighbours_list_orig, length) == 0)
+
+if (length(island_indices_orig) > 0) {
+  cat("Identified", length(island_indices_orig), "island cells (based on original indices):\n")
+  print(head(island_indices_orig))
+} else {
+  cat("No island cells identified.\n")
+}
+cat("--- End of island identification --- \n\n")
+
+
+# --- Step 1b: Filter the main dataframe 'dat' to REMOVE islands ---
+if (length(island_indices_orig) > 0) {
+    cat("Removing", length(island_indices_orig), "island cells from the main 'dat' dataframe.\n")
+    # Filter rows where the original index is NOT in the island list
+    dat <- dat_original %>%
+        filter(! (idx %in% island_indices_orig) ) %>%
+        # CRUCIAL: Re-create the sequential index for the filtered data
+        mutate(idx = 1:n())
+
+    cat("Dataframe 'dat' now has", nrow(dat), "rows after removing islands.\n")
+    cat("New range of 'idx':", paste(range(dat$idx), collapse=" to "), "\n")
+} else {
+    cat("No islands to remove. Proceeding with original data.\n")
+    # Ensure idx is sequential just in case
+    dat <- dat_original %>% mutate(idx = 1:n())
+}
+```
+
+
+```{r}
+# --- Create Spatial Neighborhood Graph File (Grid Indexing Method) ---
+
+# --- Step 1: Ensure Data and Coordinates are Ready ---
+
+# Verify required columns exist
+if (!all(c("lon", "lat", "idx") %in% names(dat))) {
+  stop("Data frame 'dat' must contain 'lon', 'lat', and 'idx' columns.")
+}
+# Ensure idx is sequential (this check might have been done earlier, but good practice)
+if (!all(dat$idx == 1:nrow(dat))) {
+   warning("Re-creating sequential 'idx' column to match row order.")
+   dat <- dat %>% arrange(idx) %>% mutate(idx = 1:n())
+}
+
+# --- Step 2: Find Neighbors using Coordinate Logic (Queen Contiguity) ---
+cat("Finding neighbors based on grid coordinates (Queen Contiguity)...\n")
+coord_map <- setNames(as.list(dat$idx), paste(round(dat$lon, 5), round(dat$lat, 5), sep = "_"))
+neighbours_list_manual <- vector("list", nrow(dat))
+max_lon <- 179
+min_lon <- -180
+
+for (i in 1:nrow(dat)) {
+  current_idx <- dat$idx[i]
+  current_lon <- dat$lon[i]
+  current_lat <- dat$lat[i]
+  neighbor_indices <- integer(0)
+  relative_coords <- list(
+    c(0, 1), c(0, -1), c(1, 0), c(-1, 0),
+    c(1, 1), c(1, -1), c(-1, 1), c(-1, -1)
+  )
+  for (dcoords in relative_coords) {
+    dlon <- dcoords[1]; dlat <- dcoords[2]
+    target_lon <- current_lon + dlon; target_lat <- current_lat + dlat
+    if (target_lon > max_lon) { target_lon <- min_lon }
+    else if (target_lon < min_lon) { target_lon <- max_lon }
+    target_key <- paste(round(target_lon, 5), round(target_lat, 5), sep = "_")
+    if (target_key %in% names(coord_map)) {
+      neighbor_indices <- c(neighbor_indices, coord_map[[target_key]])
+    }
+  }
+  neighbours_list_manual[[current_idx]] <- sort(unique(as.integer(neighbor_indices)))
+   if (i %% 1000 == 0) { cat("Processed", i, "of", nrow(dat), "cells...\n") }
+}
+cat("Finished finding neighbors.\n") # Added confirmation message
+
+# --- Identify islands (cells with 0 neighbors) ---
+cat("Checking for cells with zero neighbours (islands)...\n")
+island_indices <- which(sapply(neighbours_list_manual, length) == 0)
+
+if (length(island_indices) > 0) {
+  cat("Found", length(island_indices), "island(s) with index (row number in 'dat'):\n")
+  # Show first few island indices
+  print(head(island_indices))
+  cat("These cells have no neighbors within the dataset.\n")
+  # Optional: Show coordinates of first few islands
+  cat("Coordinates of first few potential islands:\n")
+  print(head(dat[island_indices, c("idx", "lon", "lat")]))
+} else {
+  cat("No cells with zero neighbours found.\n")
+}
+
+
+# --- Step 3: Convert the List to an 'nb' Object ---
+cat("Converting list to nb object...\n")
+# Set attributes required for an nb object
+class(neighbours_list_manual) <- "nb"
+attr(neighbours_list_manual, "region.id") <- as.character(dat$idx) # Use idx as region IDs
+attr(neighbours_list_manual, "queen") <- TRUE # Indicate it's Queen contiguity
+coords.mat <- as.matrix(dat[, c("lon", "lat")])
+attr(neighbours_list_manual, "coords") <- coords.mat
+
+
+# --- Step 4: Export Neighbors to INLA Graph Format ---
+graph_file_path <- "output/model_data/grid_neighbours_corrected.graph" # Use a new file name
+cat("Writing corrected INLA graph file to:", graph_file_path, "\n")
+
+# Attempt to write the graph file using nb2INLA
+# nb2INLA should be more robust to islands than summary/validation functions
+tryCatch({
+    nb2INLA(graph_file_path, neighbours_list_manual)
+    cat("Corrected graph file successfully created.\n")
+}, error = function(e) {
+    cat("ERROR: Failed to write graph file using nb2INLA:", conditionMessage(e), "\n")
+    cat("This might indicate a more fundamental issue with the nb object structure.\n")
+})
+```
+
+```{r}
+# --- Scale Predictor Variables ---
+dat <- dat %>%
+  dplyr::mutate(dplyr::across(dplyr::all_of(predictor_cols), ~ scale(.)[,1]))
+print("Summary of scaled predictors (incl. ndvi_mean and vegetation_height):")
+print(summary(dat[, predictor_cols]))
+```
+
+```{r}
+# --- Visualize Predictor Maps (After Scaling) ---
+
+# Check if 'dat' has the necessary columns
+if (!all(c("lon", "lat", "idx", predictor_cols) %in% names(dat))) {
+  stop("Data frame 'dat' is missing 'lon', 'lat', 'idx', or some predictor columns for mapping.")
+}
+if (!all(dat$idx == 1:nrow(dat))) {
+   warning("Re-creating sequential 'idx' column in 'dat' before mapping predictors.")
+   dat <- dat %>% arrange(idx) %>% mutate(idx = 1:n()) # Should already be done, but good check
+}
+
+cat("\n--- Creating maps for each scaled predictor variable ---\n")
+
+# --- Create sf polygons for mapping ---
+polygon_list_predictors <- lapply(1:nrow(dat), function(i) {
+    lon_bl <- dat$lon[i]; lat_bl <- dat$lat[i]
+    # Define corners: bottom-left, bottom-right, top-right, top-left, close polygon
+    corners <- matrix(c(
+        lon_bl,     lat_bl,
+        lon_bl + 1, lat_bl,
+        lon_bl + 1, lat_bl + 1,
+        lon_bl,     lat_bl + 1,
+        lon_bl,     lat_bl      # Close the polygon
+    ), ncol = 2, byrow = TRUE)
+    st_polygon(list(corners))
+})
+
+# Create the sfc object (geometry collection)
+sfc_polygons_predictors <- st_sfc(polygon_list_predictors, crs = 4326) # WGS84 CRS
+
+# Create the sf dataframe by combining 'dat' (attributes) with 'sfc_polygons' (geometry)
+# We only need predictor columns and geometry for these maps.
+dat_sf_predictors <- st_sf(dat %>% dplyr::select(all_of(predictor_cols)), geometry = sfc_polygons_predictors)
+
+# --- Loop through each predictor and create a map ---
+predictor_maps_list <- list()
+
+for (pred_col in predictor_cols) {
+  cat("Generating map for predictor:", pred_col, "\n")
+
+  # Create the map using ggplot2
+  current_map <- ggplot() +
+    geom_sf(data = dat_sf_predictors, aes_string(fill = pred_col), color = NA) + # Use aes_string for programmatic column name
+    scale_fill_viridis_c(option = "viridis", na.value="grey80") + # Or another palette like "cividis", "plasma"
+    labs(
+      title = paste("Map of Scaled Predictor:", pred_col),
+      fill = "Scaled Value"
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text = element_blank(),
+      axis.ticks = element_blank(),
+      panel.grid = element_blank(), # Remove grid lines for a cleaner map
+      plot.title = element_text(size = 12, hjust = 0.5),
+      legend.title = element_text(size = 10),
+      legend.text = element_text(size = 8)
+    )
+
+  # Store the map 
+  predictor_maps_list[[pred_col]] <- current_map
+
+  # Print the map
+  print(current_map)
+
+  # Optional: Save individual maps
+  # ggsave(paste0("output/predictor_maps/map_", pred_col, ".png"), current_map, width = 7, height = 5, dpi = 150)
+}
+
+cat("--- Finished generating predictor maps ---\n")
+
+# Clean up large intermediate sf object if desired (optional)
+# rm(dat_sf_predictors, polygon_list_predictors, sfc_polygons_predictors)
+# gc()
+```
+
+```{r}
+# --- Map of TEI ---
+stopifnot(all(c("lon","lat","idx", tei_col) %in% names(dat)))
+poly_list_tei <- lapply(1:nrow(dat), function(i){
+  lon_bl <- dat$lon[i]; lat_bl <- dat$lat[i]
+  st_polygon(list(matrix(c(lon_bl,lat_bl, lon_bl+1,lat_bl, lon_bl+1,lat_bl+1, lon_bl,lat_bl+1, lon_bl,lat_bl),
+                         ncol=2, byrow=TRUE)))
+})
+dat_sf_tei <- st_sf(dat[c(tei_col)], geometry = st_sfc(poly_list_tei, crs = 4326))
+
+p_tei_map <- ggplot() +
+  geom_sf(data = dat_sf_tei, aes(fill = .data[[tei_col]]), color = NA) +
+  scale_fill_viridis_c(option = "cividis", na.value="grey80") +
+  labs(title = "Map of TEI", fill = "TEI") +
+  theme_minimal() +
+  theme(axis.text = element_blank(), axis.ticks = element_blank(), panel.grid = element_blank())
+print(p_tei_map)
+```
+
+```{r}
+# --- Exploratory Data Analysis: Raw Relationships ---
+
+cat("\n=== EXPLORATORY DATA ANALYSIS ===\n")
+
+# 1. Correlation matrix
+cor_matrix <- cor(dat[, c(tei_col, predictor_cols)], use = "complete.obs")
+cat("\n--- Pearson Correlations with TEI ---\n")
+cor_with_tei <- cor_matrix[tei_col, predictor_cols]
+cor_df <- data.frame(
+  Predictor = names(cor_with_tei),
+  Correlation = round(cor_with_tei, 3),
+  Abs_Correlation = round(abs(cor_with_tei), 3)
+) %>% arrange(desc(Abs_Correlation))
+print(cor_df)
+
+# 2. Visualize correlation matrix
+library(corrplot)
+corrplot(cor_matrix, method = "color", type = "upper", 
+         order = "hclust", tl.col = "black", tl.srt = 45,
+         addCoef.col = "black", number.cex = 0.7,
+         main = "Correlation Matrix: TEI and Predictors")
+
+# 3. Bivariate scatterplots with smoothers
+library(gridExtra)
+plot_list <- list()
+for(pred in predictor_cols) {
+  p <- ggplot(dat, aes_string(x = pred, y = tei_col)) +
+    geom_point(alpha = 0.1, size = 0.5) +
+    geom_smooth(method = "loess", color = "red", se = TRUE) +
+    geom_smooth(method = "lm", color = "blue", se = FALSE, linetype = "dashed") +
+    labs(title = paste("TEI vs", pred),
+         subtitle = paste("r =", round(cor_with_tei[pred], 3))) +
+    theme_minimal() +
+    theme(plot.title = element_text(size = 10),
+          plot.subtitle = element_text(size = 8))
+  plot_list[[pred]] <- p
+}
+grid.arrange(grobs = plot_list, ncol = 3)
+
+# 4. Simple linear models (no spatial structure)
+cat("\n--- Simple Linear Regression Coefficients ---\n")
+lm_simple <- lm(as.formula(paste(tei_col, "~", paste(predictor_cols, collapse = " + "))), 
+                data = dat)
+summary_lm <- summary(lm_simple)
+coef_df <- data.frame(
+  Predictor = rownames(summary_lm$coefficients),
+  Estimate = round(summary_lm$coefficients[, "Estimate"], 4),
+  StdError = round(summary_lm$coefficients[, "Std. Error"], 4),
+  t_value = round(summary_lm$coefficients[, "t value"], 2),
+  p_value = format.pval(summary_lm$coefficients[, "Pr(>|t|)"], digits = 3)
+)
+print(coef_df)
+cat("R-squared:", round(summary_lm$r.squared, 3), "\n")
+cat("Adj R-squared:", round(summary_lm$adj.r.squared, 3), "\n")
+
+# 5. Variance Inflation Factors (check multicollinearity)
+library(car)
+vif_values <- vif(lm_simple)
+cat("\n--- Variance Inflation Factors ---\n")
+vif_df <- data.frame(
+  Predictor = names(vif_values),
+  VIF = round(vif_values, 2)
+) %>% arrange(desc(VIF))
+print(vif_df)
+if(any(vif_values > 5)) {
+  cat("WARNING: VIF > 5 detected, indicating potential multicollinearity\n")
+}
+
+# 6. Partial correlations (controlling for other predictors)
+library(ppcor)
+partial_cor <- pcor(dat[, c(tei_col, predictor_cols)])
+cat("\n--- Partial Correlations with TEI ---\n")
+partial_df <- data.frame(
+  Predictor = predictor_cols,
+  Partial_r = round(partial_cor$estimate[1, 2:ncol(partial_cor$estimate)], 3),
+  p_value = format.pval(partial_cor$p.value[1, 2:ncol(partial_cor$p.value)], digits = 3)
+) %>% arrange(desc(abs(Partial_r)))
+print(partial_df)
+
+# 7. Compare simple vs partial correlations
+cat("\n--- Comparison: Simple vs Partial Correlations ---\n")
+comparison_df <- data.frame(
+  Predictor = predictor_cols,
+  Simple_r = round(cor_with_tei[predictor_cols], 3),
+  Partial_r = round(partial_cor$estimate[1, 2:ncol(partial_cor$estimate)], 3),
+  Difference = round(cor_with_tei[predictor_cols] - 
+                    partial_cor$estimate[1, 2:ncol(partial_cor$estimate)], 3)
+)
+print(comparison_df)
+
+# 8. Test spatial autocorrelation in raw TEI
+cat("\n--- Spatial Autocorrelation in Raw TEI ---\n")
+if(exists("neighbours_list_manual")) {
+  lw <- nb2listw(neighbours_list_manual, style = "W", zero.policy = TRUE)
+  moran_tei <- moran.test(dat[[tei_col]], lw, zero.policy = TRUE)
+  cat("Moran's I for TEI:", round(moran_tei$estimate[1], 3), 
+      "  p-value:", format.pval(moran_tei$p.value), "\n")
+  
+  # Also test residuals from simple linear model
+  moran_lm_resid <- moran.test(residuals(lm_simple), lw, zero.policy = TRUE)
+  cat("Moran's I for OLS residuals:", round(moran_lm_resid$estimate[1], 3),
+      "  p-value:", format.pval(moran_lm_resid$p.value), "\n")
+}
+```
+```{r}
+# --- RAW RELATIONSHIPS (add Vegetation PC1 and its link to TEI) ---------------
+
+library(dplyr)
+library(ggplot2)
+library(corrplot)
+library(gridExtra)
+
+stopifnot(exists("dat"), exists("tei_col"))
+stopifnot(all(c("ndvi_mean","vegetation_height") %in% names(dat)))
+
+# 1) Build Vegetation PC1 from (already standardized) NDVI & Vegetation height
+Xveg <- as.matrix(dat[, c("ndvi_mean","vegetation_height")])
+pca_veg <- prcomp(Xveg, center = FALSE, scale. = FALSE)
+
+dat$veg_pc1 <- as.numeric(scale(pca_veg$x[, 1])[, 1])
+
+# Orient PC1 so that higher PC1 ≈ higher NDVI & height
+s_orient <- sign(
+  (cor(dat$veg_pc1, dat$ndvi_mean, use = "complete.obs") %||% 0) +
+  (cor(dat$veg_pc1, dat$vegetation_height, use = "complete.obs") %||% 0)
+)
+if (!is.na(s_orient) && s_orient < 0) dat$veg_pc1 <- -dat$veg_pc1
+
+# 2) Correlation TEI ~ Vegetation PC1
+r_pc1 <- suppressWarnings(cor(dat[[tei_col]], dat$veg_pc1, use = "complete.obs"))
+ct_pc1 <- suppressWarnings(cor.test(dat[[tei_col]], dat$veg_pc1))
+
+cat("\n--- Pearson correlation: TEI vs Vegetation PC1 ---\n")
+cat("r =", round(r_pc1, 3), "  p-value =", format.pval(ct_pc1$p.value, digits = 3), "\n\n")
+
+# 3) Correlation matrix including veg_pc1 (replace NDVI/height or show both)
+predictor_cols_pc1 <- c("rh_mean","temp_mean","ruggedness","hfp","veg_pc1","ses_mpd")
+cm_pc1 <- cor(dat[, c(tei_col, predictor_cols_pc1)], use = "complete.obs")
+
+cat("--- Correlations with TEI (including veg_pc1) ---\n")
+cor_with_tei_pc1 <- data.frame(
+  Predictor = predictor_cols_pc1,
+  r = round(cm_pc1[tei_col, predictor_cols_pc1], 3)
+) %>% arrange(desc(abs(r)))
+print(cor_with_tei_pc1)
+
+# Optional: compare against raw vegetation components
+if (all(c("ndvi_mean","vegetation_height") %in% names(dat))) {
+  r_ndvi  <- cor(dat[[tei_col]], dat$ndvi_mean, use = "complete.obs")
+  r_vh    <- cor(dat[[tei_col]], dat$vegetation_height, use = "complete.obs")
+  comp_df <- tibble(
+    Variable = c("veg_pc1","ndvi_mean","vegetation_height"),
+    r_with_TEI = round(c(r_pc1, r_ndvi, r_vh), 3)
+  )
+  cat("\n--- TEI correlations: veg_pc1 vs components ---\n")
+  print(comp_df)
+}
+
+# 4) Visuals: corrplot + TEI~veg_pc1 scatter with smoothers
+corrplot(cm_pc1, method = "color", type = "upper",
+         order = "hclust", tl.col = "black", tl.srt = 45,
+         addCoef.col = "black", number.cex = 0.7,
+         main = "Correlation Matrix (TEI + predictors incl. veg_pc1)")
+
+p_pc1 <- ggplot(dat, aes(x = veg_pc1, y = .data[[tei_col]])) +
+  geom_point(alpha = 0.1, size = 0.5) +
+  geom_smooth(method = "loess", se = TRUE, color = "red") +
+  geom_smooth(method = "lm", se = FALSE, linetype = "dashed", color = "blue") +
+  labs(title = "TEI vs Vegetation PC1",
+       subtitle = paste("r =", round(r_pc1, 3)),
+       x = "Vegetation PC1 (z)", y = "TEI") +
+  theme_minimal()
+print(p_pc1)
+
+# 5) Simple OLS using veg_pc1 
+form_pc1 <- as.formula(paste(tei_col, "~", paste(predictor_cols_pc1, collapse = " + ")))
+lm_pc1 <- lm(form_pc1, data = dat)
+sum_pc1 <- summary(lm_pc1)
+
+cat("\n--- OLS with veg_pc1 (replacing NDVI & height) ---\n")
+coef_pc1 <- data.frame(
+  Predictor = rownames(sum_pc1$coefficients),
+  Estimate  = round(sum_pc1$coefficients[, "Estimate"], 4),
+  StdError  = round(sum_pc1$coefficients[, "Std. Error"], 4),
+  t_value   = round(sum_pc1$coefficients[, "t value"], 2),
+  p_value   = format.pval(sum_pc1$coefficients[, "Pr(>|t|)"], digits = 3)
+)
+print(coef_pc1)
+cat("R-squared:", round(sum_pc1$r.squared, 3), 
+    "  Adj R-squared:", round(sum_pc1$adj.r.squared, 3), "\n")
+
+# Optional comparison
+if (exists("lm_simple")) {
+  cat("Δ Adj R² (PC1 model − original):",
+      round(sum_pc1$adj.r.squared - summary(lm_simple)$adj.r.squared, 3), "\n")
+}
+```
+
+
+
+```{r}
+# --- Variance Partitioning Analysis (separate vegetation predictors) ---
+
+# 1) Sequential R² with vegetation predictors first
+m1 <- lm(TEI ~ ndvi_mean, data = dat)
+m2 <- lm(TEI ~ ndvi_mean + vegetation_height, data = dat)
+m3 <- lm(TEI ~ ndvi_mean + vegetation_height + temp_mean, data = dat)
+m4 <- lm(TEI ~ ndvi_mean + vegetation_height + temp_mean + rh_mean, data = dat)
+m5 <- lm(TEI ~ ndvi_mean + vegetation_height + temp_mean + rh_mean + hfp + ruggedness + ses_mpd, data = dat)
+
+cat("Sequential R² (vegetation predictors first):\n")
+cat("NDVI alone: ", round(summary(m1)$r.squared, 3), "\n")
+cat("+ Vegetation height: ", round(summary(m2)$r.squared, 3), "\n")
+cat("+ Temperature: ", round(summary(m3)$r.squared, 3), "\n")
+cat("+ Relative humidity: ", round(summary(m4)$r.squared, 3), "\n")
+cat("+ All others: ", round(summary(m5)$r.squared, 3), "\n\n")
+
+# 2) Climate-first sequence; joint marginal contribution of vegetation predictors
+c1 <- lm(TEI ~ temp_mean + rh_mean, data = dat)
+c2 <- lm(TEI ~ temp_mean + rh_mean + ndvi_mean + vegetation_height, data = dat)
+
+cat("Climate first:\n")
+cat("Temp + RH: ", round(summary(c1)$r.squared, 3), "\n")
+cat("+ NDVI + Vegetation height: ", round(summary(c2)$r.squared, 3), "\n")
+cat("Vegetation predictors' marginal contribution: ",
+    round(summary(c2)$r.squared - summary(c1)$r.squared, 4), "\n")
+```
+
+
+```{r}
+# --- Fit SPDE Model with Matérn Spatial Field  ---
+
+coords <- as.matrix(dat[, c("lon", "lat")])
+mesh <- inla.mesh.2d(
+  loc = coords,
+  max.edge = c(2, 4),
+  offset = c(1, 2),
+  cutoff = 0.5
+)
+
+spde <- inla.spde2.pcmatern(
+  mesh = mesh,
+  prior.range = c(5, 0.01),
+  prior.sigma = c(0.5, 0.01)
+)
+
+A <- inla.spde.make.A(mesh = mesh, loc = coords)
+
+stack <- inla.stack(
+  data = list(y = dat$TEI),
+  A = list(A, 1),
+  effects = list(
+    s = 1:spde$n.spde,
+    list(Intercept = 1,
+         rh_mean = dat$rh_mean,
+         temp_mean = dat$temp_mean,
+         ruggedness = dat$ruggedness,
+         hfp = dat$hfp,
+         ndvi_mean = dat$ndvi_mean,
+         vegetation_height = dat$vegetation_height,
+         ses_mpd = dat$ses_mpd)
+  ),
+  tag = "est"
+)
+
+formula_spde <- y ~ -1 + Intercept +
+  rh_mean + temp_mean + ruggedness + hfp + ndvi_mean + vegetation_height + ses_mpd +
+  f(s, model = spde)
+
+result_spde <- inla(
+  formula_spde,
+  family = "gaussian",
+  data = inla.stack.data(stack),
+  control.predictor = list(A = inla.stack.A(stack), compute = TRUE),
+  control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE, config = TRUE),
+  control.inla = list(strategy = "adaptive", int.strategy = "eb", diagonal = 100),
+  verbose = F
+)
+
+
+# Extract fitted values and calculate residuals
+index_est <- inla.stack.index(stack, "est")$data
+fitted_values <- result_spde$summary.fitted.values$mean[index_est]
+residuals <- dat$TEI - fitted_values
+
+# Test residual autocorrelation
+nb_obj <- spdep::knn2nb(spdep::knearneigh(coords, k = 8))
+listw_obj <- spdep::nb2listw(nb_obj, style = "W", zero.policy = TRUE)
+moran_test <- spdep::moran.test(residuals, listw_obj, zero.policy = TRUE)
+
+# Extract spatial field parameters
+spde_result <- inla.spde2.result(result_spde, "s", spde)
+```
+
+```{r}
+# --- Complete SPDE Model Results with Fixed Output ---
+
+# Extract spatial field parameters correctly
+spde_result <- inla.spde2.result(result_spde, "s", spde)
+
+cat("\n=== SPDE Model Results ===\n")
+cat("DIC:", result_spde$dic$dic, "\n")
+cat("WAIC:", result_spde$waic$waic, "\n")
+cat("Residual Moran's I:", round(moran_test$estimate[1], 4), 
+    "  p-value:", format.pval(moran_test$p.value), "\n\n")
+
+# Hyperparameters
+cat("--- Spatial Field Parameters ---\n")
+cat("Practical range:", round(spde_result$summary.log.range.nominal$mean, 2), "degrees\n")
+cat("Marginal SD:", round(spde_result$summary.log.variance.nominal$mean, 3), "\n")
+cat("Observation precision:", 
+    round(result_spde$summary.hyperpar["Precision for the Gaussian observations", "mean"], 3), "\n\n")
+
+# Fixed effects
+cat("--- Fixed Effects ---\n")
+print(result_spde$summary.fixed[, c("mean", "0.025quant", "0.975quant")])
+
+# Model fit summary
+cat("\n--- Model Fit Summary ---\n")
+cat("Residual SD:", round(sd(residuals), 4), "\n")
+cat("R-squared (approximate):", round(1 - var(residuals)/var(dat$TEI), 3), "\n")
+cat("CPO failure rate:", round(mean(result_spde$cpo$failure, na.rm=TRUE), 3), "\n")
+
+# Optional: Plot residuals vs fitted for diagnostic
+plot(fitted_values, residuals, 
+     main = "Residuals vs Fitted (SPDE Model)",
+     xlab = "Fitted values", ylab = "Residuals",
+     pch = 16, cex = 0.5, col = rgb(0,0,0,0.3))
+abline(h = 0, col = "red", lty = 2)
+
+# Optional: Spatial plot of residuals to confirm no pattern
+dat_resid <- dat
+dat_resid$residuals <- residuals
+ggplot(dat_resid, aes(x = lon, y = lat, color = residuals)) +
+  geom_point(size = 0.5) +
+  scale_color_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  labs(title = "Spatial Distribution of Residuals (SPDE Model)",
+       subtitle = paste("Moran's I =", round(moran_test$estimate[1], 4))) +
+  theme_minimal()
+```
+
+
+```{r}
+# --- Forest Plot for Fixed Effects ---
+
+# 1. Load necessary libraries
+library(ggplot2)
+library(dplyr)
+library(forcats)
+
+# 2. Extract the summary of fixed effects 
+# This creates a data frame from the summary table
+fixed_effects <- as.data.frame(result_spde$summary.fixed)
+
+# Add the variable names (which are rownames) as a new column
+fixed_effects$Variable <- rownames(fixed_effects)
+
+# 3. Prepare the data for plotting
+#    - Filter out the intercept if it exists 
+#    - Reorder the variables based on their effect size (mean) for better visual interpretation
+plot_data <- fixed_effects %>%
+  filter(Variable != "Intercept") %>%
+  mutate(Variable = fct_reorder(Variable, mean)) # Reorder Factor levels by mean
+
+# 4. Create the forest plot using ggplot2
+forest_plot <- ggplot(plot_data, aes(x = mean, y = Variable)) +
+  # Add a vertical line at x=0 for reference (the "no effect" line)
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray60", linewidth = 0.8) +
+  
+  # Add the error bars representing the 95% credible interval
+  geom_errorbarh(aes(xmin = `0.025quant`, xmax = `0.975quant`), 
+                 height = 0.2, 
+                 linewidth = 0.8,
+                 color = "#0072B2") +
+                 
+  # Add the point estimate (the mean)
+  geom_point(size = 3.5, shape = 18, color = "#D55E00") +
+  
+  # Apply labels and a title
+  labs(
+    title = "Forest Plot of Fixed Effects",
+    subtitle = "Estimates and 95% Credible Intervals from SPDE Model",
+    x = "Coefficient Estimate (Effect Size)",
+    y = NULL  # Remove y-axis label for a cleaner look
+  ) +
+  
+  # Use a clean, professional theme
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, color = "gray30"),
+    panel.grid.major.y = element_blank(), # Remove horizontal grid lines
+    panel.grid.minor.x = element_blank(),
+    axis.ticks.y = element_blank(), # Remove y-axis ticks
+    legend.position = "none"
+  )
+forest_plot
+```
+
+
+
+```{r}
+# --- SYSTEMATIC COMPARISON OF SPATIAL APPROACHES ---
+
+cat("\n=== COMPARING SPATIAL MODELS FOR MORAN'S I REDUCTION ===\n")
+
+# 1. OLS (baseline)
+formula_ols <- as.formula(paste(tei_col, "~", paste(predictor_cols, collapse = " + ")))
+model_ols <- lm(formula_ols, data = dat)
+resid_ols <- residuals(model_ols)
+moran_ols <- moran.test(resid_ols, listw_obj, zero.policy = TRUE)
+
+# 2. BYM2 model
+g <- inla.read.graph(graph_file_path)
+formula_bym2 <- TEI ~ rh_mean + temp_mean + ruggedness + hfp + ndvi_mean + vegetation_height + ses_mpd +
+  f(idx, model = "bym2", graph = g, scale.model = TRUE,
+    hyper = list(
+      prec = list(prior = "pc.prec", param = c(0.5, 0.01)),
+      phi = list(prior = "pc", param = c(0.5, 0.5))
+    ))
+
+model_bym2 <- inla(formula_bym2, family = "gaussian", data = dat,
+                   control.compute = list(dic = TRUE, waic = TRUE),
+                   control.predictor = list(compute = TRUE),
+                   verbose = FALSE)
+
+fitted_bym2 <- model_bym2$summary.fitted.values$mean[1:nrow(dat)]
+resid_bym2 <- dat$TEI - fitted_bym2
+moran_bym2 <- moran.test(resid_bym2, listw_obj, zero.policy = TRUE)
+
+# 3. SPDE (already fitted as result_spde)
+# Using existing result_spde, residuals, and moran_test
+
+# Comparison table
+spatial_comparison <- data.frame(
+  Model = c("OLS", "BYM2", "SPDE"),
+  DIC = c(NA, 
+          round(model_bym2$dic$dic, 1),
+          round(result_spde$dic$dic, 1)),
+  WAIC = c(NA,
+           round(model_bym2$waic$waic, 1),
+           round(result_spde$waic$waic, 1)),
+  Morans_I = c(round(moran_ols$estimate[1], 3),
+               round(moran_bym2$estimate[1], 3),
+               round(moran_test$estimate[1], 3)),
+  P_value = c(format.pval(moran_ols$p.value),
+              format.pval(moran_bym2$p.value),
+              format.pval(moran_test$p.value)),
+  R_squared = c(round(summary(model_ols)$r.squared, 3),
+                round(1 - var(resid_bym2)/var(dat$TEI), 3),
+                round(1 - var(residuals)/var(dat$TEI), 3))
+)
+
+print(spatial_comparison)
+
+cat("\nBEST SPATIAL MODEL:", spatial_comparison$Model[which.min(abs(spatial_comparison$Morans_I))], "\n")
+cat("Achieves Moran's I =", min(abs(spatial_comparison$Morans_I)), "\n\n")
+```
+
+```{r}
+# --- COMPARISON OF FIXED EFFECTS ACROSS MODELS ---
+
+library(ggplot2)
+library(dplyr)
+library(gt)
+library(tidyr)
+
+cat("\n=== EXTRACTING FIXED EFFECTS FROM ALL THREE MODELS ===\n")
+
+# 1. Extract OLS coefficients
+ols_coefs <- summary(model_ols)$coefficients
+ols_effects <- data.frame(
+  Variable = rownames(ols_coefs)[-1],  # Exclude intercept
+  OLS_mean = ols_coefs[-1, "Estimate"],
+  OLS_se = ols_coefs[-1, "Std. Error"],
+  OLS_lower = ols_coefs[-1, "Estimate"] - 1.96 * ols_coefs[-1, "Std. Error"],
+  OLS_upper = ols_coefs[-1, "Estimate"] + 1.96 * ols_coefs[-1, "Std. Error"]
+)
+
+# 2. Extract BYM2 fixed effects
+bym2_effects <- model_bym2$summary.fixed[-1, ]  # Exclude intercept
+bym2_effects_df <- data.frame(
+  Variable = rownames(bym2_effects),
+  BYM2_mean = bym2_effects$mean,
+  BYM2_lower = bym2_effects$`0.025quant`,
+  BYM2_upper = bym2_effects$`0.975quant`
+)
+
+# 3. Extract SPDE fixed effects
+spde_effects <- result_spde$summary.fixed[-1, ]  # Exclude intercept
+spde_effects_df <- data.frame(
+  Variable = rownames(spde_effects),
+  SPDE_mean = spde_effects$mean,
+  SPDE_lower = spde_effects$`0.025quant`,
+  SPDE_upper = spde_effects$`0.975quant`
+)
+
+# 4. Merge all effects
+all_effects <- ols_effects %>%
+  left_join(bym2_effects_df, by = "Variable") %>%
+  left_join(spde_effects_df, by = "Variable")
+
+# 5. Create comparison table
+comparison_table <- all_effects %>%
+  dplyr::select(Variable, OLS_mean, BYM2_mean, SPDE_mean) %>%
+  mutate(across(c(OLS_mean, BYM2_mean, SPDE_mean), ~round(., 4)))
+
+# Pretty print the table
+cat("\n--- Fixed Effects Comparison Table ---\n")
+comparison_table %>%
+  gt() %>%
+  tab_header(
+    title = "Fixed Effects Comparison",
+    subtitle = "OLS vs BYM2 vs SPDE Models"
+  ) %>%
+  cols_label(
+    Variable = "Predictor",
+    OLS_mean = "OLS",
+    BYM2_mean = "BYM2",
+    SPDE_mean = "SPDE"
+  ) %>%
+  fmt_number(
+    columns = c(OLS_mean, BYM2_mean, SPDE_mean),
+    decimals = 4
+  ) %>%
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels()
+  ) %>%
+  print()
+
+# Print plain text version as well
+print(comparison_table)
+```
+
+```{r}
+# --- UNIVARIATE SPDE MODELS: ONE PREDICTOR AT A TIME ---
+
+cat("\n=== FITTING INDIVIDUAL SPDE MODELS (ONE PREDICTOR AT A TIME) ===\n")
+
+# List of predictors to test individually
+individual_predictors <- c("rh_mean", "temp_mean", "ruggedness", "hfp", 
+                          "ndvi_mean", "vegetation_height", "ses_mpd")
+
+# Storage for results
+univariate_results <- list()
+
+# Function to fit a single-predictor SPDE model
+fit_univariate_spde <- function(predictor_name, dat, mesh, spde, coords) {
+  cat("Fitting SPDE model with only:", predictor_name, "...\n")
+  
+  # Create the A matrix
+  A <- inla.spde.make.A(mesh = mesh, loc = coords)
+  
+  # Create the stack with only one predictor
+  effects_list <- list(
+    s = 1:spde$n.spde,
+    list(Intercept = 1)
+  )
+  effects_list[[2]][[predictor_name]] <- dat[[predictor_name]]
+  
+  stack_uni <- inla.stack(
+    data = list(y = dat$TEI),
+    A = list(A, 1),
+    effects = effects_list,
+    tag = "est"
+  )
+  
+  # Create formula with only this predictor
+  formula_uni <- as.formula(paste("y ~ -1 + Intercept +", predictor_name, "+ f(s, model = spde)"))
+  
+  # Fit the model
+  result_uni <- inla(
+    formula_uni,
+    family = "gaussian",
+    data = inla.stack.data(stack_uni),
+    control.predictor = list(A = inla.stack.A(stack_uni), compute = TRUE),
+    control.compute = list(dic = TRUE, waic = TRUE),
+    control.inla = list(strategy = "adaptive", int.strategy = "eb", diagonal = 100),
+    verbose = FALSE
+  )
+  
+  return(result_uni)
+}
+
+# Fit univariate models for each predictor
+for (pred in individual_predictors) {
+  univariate_results[[pred]] <- fit_univariate_spde(pred, dat, mesh, spde, coords)
+}
+
+cat("\n--- Extracting univariate effects ---\n")
+```
+
+```{r}
+# --- EXTRACT AND VISUALIZE INDIVIDUAL EFFECTS ---
+
+# Extract coefficients from each univariate model
+univariate_effects <- data.frame()
+
+for (pred in individual_predictors) {
+  model_result <- univariate_results[[pred]]
+  
+  # Extract the fixed effect for this predictor
+  pred_effect <- model_result$summary.fixed[pred, ]
+  
+  univariate_effects <- rbind(univariate_effects,
+    data.frame(
+      Variable = pred,
+      Mean = pred_effect$mean,
+      Lower = pred_effect$`0.025quant`,
+      Upper = pred_effect$`0.975quant`,
+      SD = pred_effect$sd
+    )
+  )
+  
+  # Also get model fit statistics
+  cat("\n", pred, "- DIC:", round(model_result$dic$dic, 1), 
+      " WAIC:", round(model_result$waic$waic, 1), "\n")
+}
+
+# Print the univariate effects table
+cat("\n--- Univariate SPDE Model Effects ---\n")
+print(univariate_effects)
+
+# Create readable labels
+univariate_effects$Variable_label <- variable_labels[univariate_effects$Variable]
+univariate_effects$Variable_label[is.na(univariate_effects$Variable_label)] <- 
+  univariate_effects$Variable[is.na(univariate_effects$Variable_label)]
+
+# Order by effect size
+univariate_effects <- univariate_effects %>%
+  arrange(desc(abs(Mean)))
+```
+
+```{r}
+# --- PLOT INDIVIDUAL FIXED EFFECTS ---
+
+# Forest plot for univariate effects
+univariate_plot <- ggplot(univariate_effects, aes(x = Mean, y = reorder(Variable_label, Mean))) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray60", linewidth = 0.8) +
+  geom_errorbarh(aes(xmin = Lower, xmax = Upper), 
+                 height = 0.2,
+                 linewidth = 1,
+                 color = "#0072B2") +
+  geom_point(size = 4, shape = 18, color = "#D55E00") +
+  labs(
+    title = "Individual Predictor Effects on TEI",
+    subtitle = "Each predictor fitted separately with SPDE spatial model",
+    x = "Coefficient Estimate",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, color = "gray30"),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    axis.text.y = element_text(size = 11, face = "bold")
+  )
+
+print(univariate_plot)
+```
+
+```{r}
+# --- COMPARISON: UNIVARIATE vs FULL MODEL EFFECTS ---
+
+# Merge univariate and full model effects for comparison
+full_model_effects <- result_spde$summary.fixed[-1, ]  # Exclude intercept
+full_effects_df <- data.frame(
+  Variable = rownames(full_model_effects),
+  Full_Mean = full_model_effects$mean,
+  Full_Lower = full_model_effects$`0.025quant`,
+  Full_Upper = full_model_effects$`0.975quant`
+)
+
+comparison_uni_full <- univariate_effects %>%
+  select(Variable, Variable_label, 
+         Univariate_Mean = Mean, 
+         Univariate_Lower = Lower, 
+         Univariate_Upper = Upper) %>%
+  left_join(full_effects_df, by = "Variable")
+
+# Prepare long format for plotting
+comparison_long <- comparison_uni_full %>%
+  select(Variable_label, Univariate_Mean, Univariate_Lower, Univariate_Upper,
+         Full_Mean, Full_Lower, Full_Upper) %>%
+  pivot_longer(
+    cols = -Variable_label,
+    names_to = c("Model", ".value"),
+    names_pattern = "(.+)_(.+)"
+  ) %>%
+  mutate(Model = factor(Model, levels = c("Univariate", "Full")))
+
+# Create comparison plot
+comparison_uni_full_plot <- ggplot(comparison_long, aes(x = Mean, y = Variable_label, color = Model)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray60", linewidth = 0.6) +
+  geom_errorbarh(aes(xmin = Lower, xmax = Upper), 
+                 position = position_dodge(width = 0.5),
+                 height = 0,
+                 linewidth = 0.9,
+                 alpha = 0.7) +
+  geom_point(position = position_dodge(width = 0.5), 
+             size = 3.5,
+             shape = 16) +
+  scale_color_manual(values = c("Univariate" = "#CC79A7", "Full" = "#009E73"),
+                     labels = c("Univariate SPDE", "Full SPDE Model")) +
+  labs(
+    title = "Univariate vs Full Model Effects",
+    subtitle = "Comparing individual predictor models to the full multivariate SPDE model",
+    x = "Coefficient Estimate",
+    y = NULL,
+    color = "Model Type"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, color = "gray30"),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position = "top",
+    legend.title = element_text(face = "bold"),
+    axis.text.y = element_text(size = 11)
+  )
+
+print(comparison_uni_full_plot)
+
+# Print summary table
+cat("\n--- Comparison Table: Univariate vs Full Model ---\n")
+comparison_table_uni_full <- comparison_uni_full %>%
+  select(Variable_label, Univariate_Mean, Full_Mean) %>%
+  mutate(
+    Univariate_Mean = round(Univariate_Mean, 4),
+    Full_Mean = round(Full_Mean, 4),
+    Difference = round(Full_Mean - Univariate_Mean, 4),
+    Percent_Change = round(100 * (Full_Mean - Univariate_Mean) / abs(Univariate_Mean), 1)
+  )
+
+comparison_table_uni_full %>%
+  gt() %>%
+  tab_header(
+    title = "Effect Size Comparison",
+    subtitle = "Univariate vs Full SPDE Model"
+  ) %>%
+  cols_label(
+    Variable_label = "Predictor",
+    Univariate_Mean = "Univariate",
+    Full_Mean = "Full Model",
+    Difference = "Difference",
+    Percent_Change = "% Change"
+  ) %>%
+  fmt_number(
+    columns = c(Univariate_Mean, Full_Mean, Difference),
+    decimals = 4
+  ) %>%
+  fmt_number(
+    columns = Percent_Change,
+    decimals = 1
+  ) %>%
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_column_labels()
+  ) %>%
+  print()
+```
+
+```{r}
+# --- FOREST PLOT COMPARING THREE MODELS ---
+
+# Prepare data for plotting
+plot_data_long <- all_effects %>%
+  select(Variable, OLS_mean, OLS_lower, OLS_upper, 
+         BYM2_mean, BYM2_lower, BYM2_upper,
+         SPDE_mean, SPDE_lower, SPDE_upper) %>%
+  pivot_longer(
+    cols = -Variable,
+    names_to = c("Model", ".value"),
+    names_pattern = "(.+)_(.+)"
+  ) %>%
+  mutate(
+    Model = factor(Model, levels = c("OLS", "BYM2", "SPDE")),
+    Variable = factor(Variable, levels = unique(Variable))
+  )
+
+# Create a more readable variable names mapping
+variable_labels <- c(
+  "rh_mean" = "Relative Humidity",
+  "temp_mean" = "Temperature",
+  "ruggedness" = "Ruggedness",
+  "hfp" = "Human Footprint",
+  "ndvi_mean" = "NDVI",
+  "vegetation_height" = "Vegetation Height",
+  "ses_mpd" = "SES MPD"
+)
+
+plot_data_long$Variable_label <- variable_labels[as.character(plot_data_long$Variable)]
+plot_data_long$Variable_label[is.na(plot_data_long$Variable_label)] <- as.character(plot_data_long$Variable)[is.na(plot_data_long$Variable_label)]
+
+# Create the comparison forest plot
+comparison_plot <- ggplot(plot_data_long, aes(x = mean, y = Variable_label, color = Model)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray60", linewidth = 0.6) +
+  geom_errorbarh(aes(xmin = lower, xmax = upper), 
+                 position = position_dodge(width = 0.5),
+                 height = 0,
+                 linewidth = 0.8,
+                 alpha = 0.7) +
+  geom_point(position = position_dodge(width = 0.5), 
+             size = 3,
+             shape = 16) +
+  scale_color_manual(values = c("OLS" = "#E69F00", "BYM2" = "#56B4E9", "SPDE" = "#009E73")) +
+  labs(
+    title = "Fixed Effects Comparison: OLS vs BYM2 vs SPDE",
+    subtitle = "Point estimates with 95% confidence/credible intervals",
+    x = "Coefficient Estimate",
+    y = NULL,
+    color = "Model"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, color = "gray30"),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    legend.position = "top",
+    legend.title = element_text(face = "bold"),
+    axis.text.y = element_text(size = 11)
+  ) +
+  facet_wrap(~Model, ncol = 3, scales = "free_x")
+
+print(comparison_plot)
+
+# Alternative view: All models on same panel
+comparison_plot_alt <- ggplot(plot_data_long, aes(x = mean, y = Variable_label, color = Model)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray60", linewidth = 0.6) +
+  geom_errorbarh(aes(xmin = lower, xmax = upper), 
+                 position = position_dodge(width = 0.6),
+                 height = 0,
+                 linewidth = 0.8,
+                 alpha = 0.7) +
+  geom_point(position = position_dodge(width = 0.6), 
+             size = 3.5,
+             shape = 16) +
+  scale_color_manual(values = c("OLS" = "#E69F00", "BYM2" = "#56B4E9", "SPDE" = "#009E73")) +
+  labs(
+    title = "Fixed Effects Comparison Across Models",
+    subtitle = "Comparing OLS, BYM2, and SPDE estimates",
+    x = "Coefficient Estimate",
+    y = NULL,
+    color = "Model"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, color = "gray30"),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position = "top",
+    legend.title = element_text(face = "bold"),
+    axis.text.y = element_text(size = 11)
+  )
+
+print(comparison_plot_alt)
+```
+
+
+```{r}
+# ==== 1) INTERACTION-FIRST MODEL (CENTERED & SCALED) ==========================
+
+# Ensure numeric, centered (mean 0) and unit-variance for main predictors used below
+center_unit <- function(x) as.numeric(scale(x))
+
+dat <- dat %>%
+  mutate(
+    z_temp = center_unit(temp_mean),
+    z_rh   = center_unit(rh_mean),
+    z_veg  = center_unit(veg_pc1 %||% veg_pc1),   # veg_pc1 already exists earlier; keep name z_veg
+    z_rug  = center_unit(ruggedness),
+    z_hfp  = center_unit(hfp),
+    z_ses  = center_unit(ses_mpd)
+  ) %>%
+  mutate(
+    # interactions (formed AFTER centering)
+    int_temp_rh  = z_temp * z_rh,
+    int_temp_veg = z_temp * z_veg,
+    int_rh_veg   = z_rh   * z_veg
+  )
+
+# Build stack
+stack_int <- inla.stack(
+  data = list(y = dat$TEI),
+  A    = list(A, 1),
+  effects = list(
+    s = 1:spde$n.spde,
+    list(Intercept = 1,
+         z_temp = dat$z_temp, z_rh = dat$z_rh, z_rug = dat$z_rug,
+         z_hfp  = dat$z_hfp,  z_veg = dat$z_veg, z_ses = dat$z_ses,
+         int_temp_rh  = dat$int_temp_rh,
+         int_temp_veg = dat$int_temp_veg,
+         int_rh_veg   = dat$int_rh_veg)
+  ),
+  tag = "est"
+)
+
+# Formulas for: (i) no vegetation, (ii) +vegetation main effect, (iii) +interactions
+f_noveg <- y ~ -1 + Intercept + z_temp + z_rh + z_rug + z_hfp + z_ses + f(s, model = spde)
+f_veg   <- update(f_noveg, . ~ . + z_veg)
+f_int   <- update(f_veg,   . ~ . + int_temp_rh + int_temp_veg + int_rh_veg)
+
+ctrl_pred <- list(A = inla.stack.A(stack_int), compute = TRUE)
+ctrl_comp <- list(dic = TRUE, waic = TRUE, cpo = TRUE, config = TRUE)  # config=TRUE keeps cov.fixed
+ctrl_inla <- list(strategy = "adaptive", int.strategy = "eb", diagonal = 100)
+
+mod_noveg <- inla(f_noveg, family = "gaussian",
+                  data = inla.stack.data(stack_int),
+                  control.predictor = ctrl_pred,
+                  control.compute   = ctrl_comp,
+                  control.inla      = ctrl_inla, verbose = FALSE)
+
+mod_veg <- inla(f_veg, family = "gaussian",
+                data = inla.stack.data(stack_int),
+                control.predictor = ctrl_pred,
+                control.compute   = ctrl_comp,
+                control.inla      = ctrl_inla, verbose = FALSE)
+
+mod_int <- inla(f_int, family = "gaussian",
+                data = inla.stack.data(stack_int),
+                control.predictor = ctrl_pred,
+                control.compute   = ctrl_comp,
+                control.inla      = ctrl_inla, verbose = FALSE)
+
+# Collect comparison (used later in the WAIC strip)
+idx_est <- inla.stack.index(stack_int, "est")$data
+r2_fun <- function(m) { yhat <- m$summary.fitted.values$mean[idx_est];
+                        1 - var(dat$TEI - yhat)/var(dat$TEI) }
+
+waic_table <- tibble::tibble(
+  model = c("No vegetation", "Vegetation (main)", "Vegetation × climate"),
+  WAIC  = c(mod_noveg$waic$waic, mod_veg$waic$waic, mod_int$waic$waic),
+  DIC   = c(mod_noveg$dic$dic,   mod_veg$dic$dic,   mod_int$dic$dic),
+  R2    = c(r2_fun(mod_noveg),   r2_fun(mod_veg),   r2_fun(mod_int))
+) %>%
+  mutate(Delta_vs_NoVeg = WAIC - WAIC[model == "No vegetation"])
+
+print(waic_table)
+```
+
+
+```{r}
+# ==== SUPER-ROBUST VEGETATION SELECTION (INLA, diagonal=100) ====
+# Adds: all other fixed effects, vegetation variance share (partial R2), and abs-beta importance.
+
+safemean <- function(x) mean(x[is.finite(x)], na.rm = TRUE)
+
+# Ensure knn-based weights for Moran's I
+if (!exists("listw_obj")) {
+  nb_obj <- spdep::knn2nb(spdep::knearneigh(coords, k = 8))
+  listw_obj <- spdep::nb2listw(nb_obj, style = "W", zero.policy = TRUE)
+}
+
+# Build vegetation encodings on already scaled columns
+z_ndvi <- dat$ndvi_mean
+z_vh   <- dat$vegetation_height
+dat$veg_index <- as.numeric((z_ndvi + z_vh) / sqrt(2))                 # equal-weight index
+pca_veg <- prcomp(cbind(z_ndvi, z_vh), center = FALSE, scale. = FALSE) # PC on standardized inputs
+dat$veg_pc1 <- as.numeric(scale(pca_veg$x[, 1])[, 1])
+
+veg_specs <- list(
+  separate = list(cols = c("ndvi_mean","vegetation_height"), label = "NDVI + Height"),
+  index    = list(cols = c("veg_index"),                   label = "VegIndex (zNDVI+zH)/√2"),
+  pca1     = list(cols = c("veg_pc1"),                     label = "Veg PC1"),
+  none     = list(cols = character(0),                     label = "No vegetation")
+)
+
+base_covs <- c("rh_mean","temp_mean","ruggedness","hfp","ses_mpd")
+
+# Constrained SPDE objects if missing
+if (!exists("spde_constrained") || !exists("A_constrained")) {
+  mesh_constrained <- inla.mesh.2d(loc = coords, max.edge = c(5,10), offset = c(2,4), cutoff = 2)
+  spde_constrained <- inla.spde2.pcmatern(
+    mesh = mesh_constrained,
+    prior.range = c(20, 0.5),
+    prior.sigma = c(0.3, 0.5)
+  )
+  A_constrained <- inla.spde.make.A(mesh = mesh_constrained, loc = coords)
+}
+
+# Use the same numerical settings everywhere
+CTRL_INLA  <- list(strategy = "adaptive", int.strategy = "eb", diagonal = 100)
+CTRL_COMP  <- list(dic = TRUE, waic = TRUE, cpo = TRUE, config = TRUE)
+
+# VIF helper (returns max VIF; with 1 predictor we define VIF=1)
+vif_max_from <- function(df_predictors) {
+  dfp <- as.data.frame(df_predictors)
+  if (ncol(dfp) <= 1) return(1)
+  suppressWarnings({
+    m <- try(lm(dat$TEI ~ ., data = cbind(dat["TEI"], dfp)), silent = TRUE)
+  })
+  if (inherits(m, "try-error")) return(NA_real_)
+  v <- try(car::vif(m), silent = TRUE)
+  if (inherits(v, "try-error")) return(NA_real_) else return(max(as.numeric(v), na.rm = TRUE))
+}
+
+# One fit
+fit_variant <- function(spde_type = c("flex","constrained"), veg_name) {
+  spde_type <- match.arg(spde_type)
+  vcols <- veg_specs[[veg_name]]$cols
+
+  if (spde_type == "flex") {
+    if (!exists("spde") || !exists("A")) {
+      mesh <<- inla.mesh.2d(loc = coords, max.edge = c(2,4), offset = c(1,2), cutoff = 0.5)
+      spde <<- inla.spde2.pcmatern(mesh = mesh, prior.range = c(5,0.01), prior.sigma = c(0.5,0.01))
+      A <<- inla.spde.make.A(mesh = mesh, loc = coords)
+    }
+    A_loc <- A; spde_loc <- spde
+  } else {
+    A_loc <- A_constrained; spde_loc <- spde_constrained
+  }
+
+  # Stack & formula
+  eff_fixed <- c("Intercept", base_covs, vcols)
+  effects_list <- list(
+    s = 1:spde_loc$n.spde,
+    stats::setNames(
+      object = cbind(Intercept = 1, as.data.frame(dat[, c(base_covs, vcols), drop = FALSE])),
+      nm     = eff_fixed
+    )
+  )
+  stk <- inla.stack(data = list(y = dat$TEI), A = list(A_loc, 1), effects = effects_list, tag = "est")
+
+  rhs <- paste(c("-1 + Intercept", base_covs, vcols), collapse = " + ")
+  fml <- stats::as.formula(paste("y ~", rhs, "+ f(s, model = spde_loc)"))
+
+  fit <- inla(
+    fml, family = "gaussian",
+    data = inla.stack.data(stk),
+    control.predictor = list(A = inla.stack.A(stk), compute = TRUE),
+    control.compute   = CTRL_COMP,
+    control.inla      = CTRL_INLA,
+    verbose = FALSE
+  )
+
+  idx <- inla.stack.index(stk, "est")$data
+  yhat <- fit$summary.fitted.values$mean[idx]
+  res  <- dat$TEI - yhat
+
+  dic   <- unname(fit$dic$dic)
+  waic  <- unname(fit$waic$waic)
+  pwaic <- unname(fit$waic$p.eff)
+  lcpo  <- -sum(log(pmax(fit$cpo$cpo[idx], .Machine$double.eps)), na.rm = TRUE)
+  cpo_fail <- mean(fit$cpo$failure[idx], na.rm = TRUE)
+  R2 <- 1 - stats::var(res)/stats::var(dat$TEI)
+
+  mi   <- spdep::moran.test(res, listw_obj, zero.policy = TRUE)
+  moranI <- as.numeric(mi$estimate[1]); p_moran <- as.numeric(mi$p.value)
+
+  sp_mean <- as.vector(A_loc %*% fit$summary.random$s$mean[1:spde_loc$n.spde])
+  cor_sp_veg <- if (length(vcols) == 0) NA_real_ else {
+    Xv <- as.matrix(dat[, vcols, drop = FALSE]); max(abs(stats::cor(sp_mean, Xv, use = "complete.obs")))
+  }
+
+  # VIF using all fixed predictors in this variant
+  vif_max <- vif_max_from(dat[, c(base_covs, vcols), drop = FALSE])
+
+  # Fixed-effect sizes (posterior means)
+  get_beta <- function(var) if (var %in% rownames(fit$summary.fixed)) fit$summary.fixed[var, "mean"] else NA_real_
+
+  # Vegetation betas
+  beta_ndvi   <- get_beta("ndvi_mean")
+  beta_height <- get_beta("vegetation_height")
+  beta_index  <- if ("veg_index" %in% vcols) get_beta("veg_index")
+                 else if ("veg_pc1" %in% vcols) get_beta("veg_pc1") else NA_real_
+  idx_type    <- if ("veg_index" %in% vcols) "Index" else if ("veg_pc1" %in% vcols) "PC1" else NA_character_
+  beta_sum    <- if (all(c("ndvi_mean","vegetation_height") %in% rownames(fit$summary.fixed))) beta_ndvi + beta_height else NA_real_
+
+  # Base betas
+  beta_temp <- get_beta("temp_mean")
+  beta_rh   <- get_beta("rh_mean")
+  beta_rug  <- get_beta("ruggedness")
+  beta_hfp  <- get_beta("hfp")
+  beta_ses  <- get_beta("ses_mpd")
+
+  other_betas_str <- paste0(
+    "temp=", round(beta_temp,4), "; rh=", round(beta_rh,4),
+    "; rug=", round(beta_rug,4), "; hfp=", round(beta_hfp,4),
+    "; ses_mpd=", round(beta_ses,4)
+  )
+
+  # Relative-importance proxy from standardized abs betas
+  abs_all <- c(abs(beta_temp), abs(beta_rh), abs(beta_rug), abs(beta_hfp), abs(beta_ses))
+  abs_veg <- numeric(0)
+  if (!is.na(beta_ndvi))   abs_veg <- c(abs_veg, abs(beta_ndvi))
+  if (!is.na(beta_height)) abs_veg <- c(abs_veg, abs(beta_height))
+  if (!is.na(beta_index))  abs_veg <- c(abs_veg, abs(beta_index))
+  abs_all <- c(abs_all, abs_veg)
+  RelImpVeg_AbsBeta <- if (length(abs_veg)==0 || sum(abs_all)==0) NA_real_ else sum(abs_veg)/sum(abs_all)
+
+  list(
+    fit = fit, stk = stk, spde = spde_loc, A = A_loc,
+    spec = veg_name, spec_cols = vcols, spde_type = spde_type,
+    dic = dic, waic = waic, pwaic = pwaic, lcpo = lcpo, cpo_fail = cpo_fail,
+    R2 = R2, moranI = moranI, p_moran = p_moran,
+    cor_sp_veg = cor_sp_veg, vif_max = vif_max,
+    Beta_NDVI = beta_ndvi, Beta_Height = beta_height,
+    Beta_NDVIplusHeight = beta_sum, Beta_VegIndex = beta_index, VegIndex_Type = idx_type,
+    Beta_temp_mean = beta_temp, Beta_rh_mean = beta_rh, Beta_ruggedness = beta_rug,
+    Beta_hfp = beta_hfp, Beta_ses_mpd = beta_ses,
+    OtherBetas = other_betas_str,
+    RelImpVeg_AbsBeta = RelImpVeg_AbsBeta
+  )
+}
+
+# Fit grid
+variants <- expand.grid(spde_type = c("flex","constrained"), veg = names(veg_specs), stringsAsFactors = FALSE)
+fits <- purrr::pmap(variants, ~ fit_variant(spde_type = ..1, veg_name = ..2))
+
+# Collect table
+tab <- purrr::map_dfr(fits, function(x){
+  data.frame(
+    SPDE        = x$spde_type,
+    Vegetation  = veg_specs[[x$spec]]$label,
+    k_veg       = length(x$spec_cols),
+    WAIC        = round(x$waic, 2),
+    DIC         = round(x$dic, 2),
+    p_WAIC      = round(x$pwaic, 2),
+    LCPO        = round(x$lcpo, 2),
+    CPO_fail    = round(x$cpo_fail, 3),
+    MoranI      = round(x$moranI, 3),
+    p_Moran     = signif(x$p_moran, 3),
+    R2          = round(x$R2, 3),
+    VIF_max     = round(x$vif_max, 2),
+    cor_sp_veg  = round(x$cor_sp_veg, 3),
+    Beta_NDVI   = round(x$Beta_NDVI, 4),
+    Beta_Height = round(x$Beta_Height, 4),
+    Beta_NDVIplusHeight = round(x$Beta_NDVIplusHeight, 4),
+    Beta_VegIndex = round(x$Beta_VegIndex, 4),
+    VegIndex_Type = x$VegIndex_Type,
+    OtherBetas  = x$OtherBetas,
+    RelImpVeg_AbsBeta = round(x$RelImpVeg_AbsBeta, 3),
+    Beta_temp_mean = round(x$Beta_temp_mean, 4),
+    Beta_rh_mean   = round(x$Beta_rh_mean, 4),
+    Beta_ruggedness= round(x$Beta_ruggedness, 4),
+    Beta_hfp       = round(x$Beta_hfp, 4),
+    Beta_ses_mpd   = round(x$Beta_ses_mpd, 4),
+    stringsAsFactors = FALSE
+  )
+})
+
+# ΔWAIC and variance attribution within each SPDE prior
+tab <- tab %>%
+  dplyr::group_by(SPDE) %>%
+  dplyr::mutate(
+    WAIC_noVeg = WAIC[Vegetation=="No vegetation"][1],
+    R2_noVeg   = R2[Vegetation=="No vegetation"][1],
+    Delta_WAIC = WAIC - min(WAIC, na.rm = TRUE),
+    Delta_vs_NoVeg = WAIC - WAIC_noVeg,
+    R2_gain_veg = dplyr::if_else(Vegetation=="No vegetation", NA_real_, R2 - R2_noVeg),
+    Partial_R2_veg = dplyr::if_else(Vegetation=="No vegetation", NA_real_,
+                                    (R2 - R2_noVeg) / (1 - R2_noVeg)),
+    Share_R2_from_veg = dplyr::if_else(Vegetation=="No vegetation" | R2<=0, NA_real_,
+                                       (R2 - R2_noVeg) / R2),
+    rank_WAIC  = rank(WAIC, ties.method = "min")
+  ) %>%
+  dplyr::ungroup()
+
+# Average rank across priors
+tab <- tab %>%
+  dplyr::group_by(Vegetation) %>%
+  dplyr::mutate(avg_rank_across_SPDE = mean(rank_WAIC)) %>%
+  dplyr::ungroup()
+
+# Print table
+gt::gt(tab %>% dplyr::arrange(SPDE, WAIC)) %>%
+  gt::tab_header(title = "Vegetation Encodings vs SPDE Priors: Model Comparison (diagonal=100)") %>%
+  gt::fmt_missing(everything(), missing_text = "-") %>%
+  gt::tab_spanner(label = "Information Criteria", columns = c(WAIC, DIC, p_WAIC, Delta_WAIC, Delta_vs_NoVeg)) %>%
+  gt::tab_spanner(label = "Out-of-sample & Dependence", columns = c(LCPO, CPO_fail, MoranI, p_Moran, R2)) %>%
+  gt::tab_spanner(label = "Diagnostics", columns = c(VIF_max, cor_sp_veg)) %>%
+  gt::tab_spanner(label = "Vegetation Effect Sizes (posterior means)", 
+                  columns = c(Beta_NDVI, Beta_Height, Beta_NDVIplusHeight, Beta_VegIndex, VegIndex_Type)) %>%
+  gt::tab_spanner(label = "Other fixed effects (posterior means)", 
+                  columns = c(Beta_temp_mean, Beta_rh_mean, Beta_ruggedness, Beta_hfp, Beta_ses_mpd, OtherBetas)) %>%
+  gt::tab_spanner(label = "Vegetation contribution to variance / importance",
+                  columns = c(R2_noVeg, R2_gain_veg, Partial_R2_veg, Share_R2_from_veg, RelImpVeg_AbsBeta)) %>%
+  gt::cols_label(
+    cor_sp_veg = "corr(spatial, veg)",
+    Beta_NDVIplusHeight = "Beta_NDVI+Height",
+    Beta_VegIndex = "Beta_VegIndex",
+    VegIndex_Type = "Index type",
+    R2_noVeg = "R2 (No veg)",
+    R2_gain_veg = "ΔR2 (veg)",
+    Partial_R2_veg = "Partial R2 (veg)",
+    Share_R2_from_veg = "Share of R2 (veg)",
+    RelImpVeg_AbsBeta = "|β| share (veg)"
+  )%>%
+  # Add this block to control row height and font size
+  gt::tab_options(
+    # Reduce vertical padding in data rows (most important setting)
+    data_row.padding = gt::px(1), 
+    # Optionally, reduce padding in the column headers
+    column_labels.padding = gt::px(3),
+    # Optionally, make the font smaller
+    table.font.size = gt::px(10) 
+  )
+
+# Winners (overall) and best-with-vegetation per prior
+winners <- tab %>%
+  dplyr::group_by(SPDE) %>%
+  dplyr::arrange(WAIC, LCPO, k_veg) %>%
+  dplyr::summarise(best = Vegetation[1], .groups = "drop")
+
+winners_with_veg <- tab %>%
+  dplyr::filter(Vegetation != "No vegetation") %>%
+  dplyr::group_by(SPDE) %>%
+  dplyr::arrange(WAIC, LCPO, k_veg) %>%
+  dplyr::summarise(best_with_veg = Vegetation[1], .groups = "drop")
+
+print(winners)
+print(winners_with_veg)
+```
+
+```{r}
+# --- DIAGONAL SENSITIVITY (keeps mesh/priors fixed) ----------------------------
+
+diag_grid <- c(50, 100, 150, 200)
+
+run_once <- function(diag_val) {
+  CTRL_INLA <- list(strategy="adaptive", int.strategy="eb", diagonal=diag_val)
+  CTRL_COMP <- list(dic=TRUE, waic=TRUE, cpo=TRUE, config=TRUE)
+
+  fit_variant <- function(spde_type = c("flex","constrained"), veg_name) {
+    spde_type <- match.arg(spde_type)
+    vcols <- veg_specs[[veg_name]]$cols
+    if (spde_type == "flex") { A_loc <- A; spde_loc <- spde } else { A_loc <- A_constrained; spde_loc <- spde_constrained }
+
+    eff_fixed <- c("Intercept", base_covs, vcols)
+    effects_list <- list(
+      s = 1:spde_loc$n.spde,
+      stats::setNames(
+        object = cbind(Intercept = 1, as.data.frame(dat[, c(base_covs, vcols), drop = FALSE])),
+        nm     = eff_fixed
+      )
+    )
+    stk <- inla.stack(data = list(y = dat$TEI), A = list(A_loc, 1), effects = effects_list, tag = "est")
+
+    rhs <- paste(c("-1 + Intercept", base_covs, vcols), collapse = " + ")
+    fml <- stats::as.formula(paste("y ~", rhs, "+ f(s, model = spde_loc)"))
+
+    fit <- inla(
+      fml, family="gaussian",
+      data = inla.stack.data(stk),
+      control.predictor = list(A = inla.stack.A(stk), compute = TRUE),
+      control.compute   = CTRL_COMP,
+      control.inla      = CTRL_INLA,
+      verbose = FALSE
+    )
+
+    idx <- inla.stack.index(stk, "est")$data
+    yhat <- fit$summary.fitted.values$mean[idx]
+    res  <- dat$TEI - yhat
+
+    # metrics
+    waic <- unname(fit$waic$waic); dic <- unname(fit$dic$dic)
+    lcpo <- -sum(log(pmax(fit$cpo$cpo[idx], .Machine$double.eps)), na.rm=TRUE)
+    cpo_fail <- mean(fit$cpo$failure[idx], na.rm=TRUE)
+    R2 <- 1 - var(res)/var(dat$TEI)
+    mi <- spdep::moran.test(res, listw_obj, zero.policy = TRUE)
+    moranI <- as.numeric(mi$estimate[1]); p_moran <- as.numeric(mi$p.value)
+
+    # effect sizes
+    b <- fit$summary.fixed
+    beta_ndvi   <- if ("ndvi_mean" %in% rownames(b)) b["ndvi_mean","mean"] else NA_real_
+    beta_height <- if ("vegetation_height" %in% rownames(b)) b["vegetation_height","mean"] else NA_real_
+    beta_sum    <- if (all(c("ndvi_mean","vegetation_height") %in% rownames(b))) beta_ndvi + beta_height else NA_real_
+    beta_index  <- if ("veg_index" %in% rownames(b)) b["veg_index","mean"] else if ("veg_pc1" %in% rownames(b)) b["veg_pc1","mean"] else NA_real_
+    idx_type    <- if ("veg_index" %in% rownames(b)) "Index" else if ("veg_pc1" %in% rownames(b)) "PC1" else NA_character_
+
+    data.frame(
+      diagonal = diag_val,
+      SPDE = spde_type,
+      Vegetation = veg_specs[[veg_name]]$label,
+      k_veg = length(vcols),
+      WAIC = round(waic, 2),
+      DIC  = round(dic, 2),
+      LCPO = round(lcpo, 2),
+      CPO_fail = round(cpo_fail, 3),
+      MoranI = round(moranI, 3),
+      p_Moran = signif(p_moran, 3),
+      R2 = round(R2, 3),
+      Beta_NDVI = round(beta_ndvi, 4),
+      Beta_Height = round(beta_height, 4),
+      Beta_NDVIplusHeight = round(beta_sum, 4),
+      Beta_VegIndex = round(beta_index, 4),
+      VegIndex_Type = idx_type,
+      stringsAsFactors = FALSE
+    )
+  }
+
+  # fit all veg specs for both priors at this diagonal
+  expand.grid(spde_type = c("flex","constrained"), veg = names(veg_specs),
+              stringsAsFactors = FALSE) |>
+    purrr::pmap_dfr(~ fit_variant(..1, ..2)) |>
+    dplyr::group_by(SPDE) |>
+    dplyr::mutate(
+      Delta_WAIC = WAIC - min(WAIC, na.rm=TRUE),
+      Delta_vs_NoVeg = WAIC - WAIC[Vegetation=="No vegetation"][1]
+    ) |>
+    dplyr::ungroup()
+}
+
+# Run grid (same mesh/priors!)
+sens_tab <- do.call(rbind, lapply(diag_grid, run_once))
+
+# Winners per prior and diagonal
+winners_all <- sens_tab |>
+  dplyr::group_by(diagonal, SPDE) |>
+  dplyr::arrange(WAIC, LCPO, k_veg) |>
+  dplyr::summarise(
+    Winner = Vegetation[1],
+    Winner_WAIC = WAIC[1],
+    .groups = "drop"
+  )
+
+# Best-with-vegetation (exclude "No vegetation")
+winners_with_veg <- sens_tab |>
+  dplyr::filter(Vegetation != "No vegetation") |>
+  dplyr::group_by(diagonal, SPDE) |>
+  dplyr::arrange(WAIC, LCPO, k_veg) |>
+  dplyr::summarise(
+    Winner_with_veg = Vegetation[1],
+    WAIC_with_veg = WAIC[1],
+    .groups = "drop"
+  )
+
+print(winners_all)
+print(winners_with_veg)
+
+```
+
+
+
+
+```{r}
+# --- TEST FOR TROPICAL FOREST INTERACTION ---
+
+# Create tropical forest indicator using PC1
+dat$tropical <- ifelse(dat$temp_mean > 0.5 & dat$rh_mean > 0.5 & dat$veg_pc1 > 0.5, 1, 0)
+
+# Interaction terms
+dat$temp_rh_interaction <- dat$temp_mean * dat$rh_mean
+dat$tropical_veg <- dat$temp_mean * dat$rh_mean * dat$veg_pc1
+
+# Quick check
+cat("Tropical cells:", sum(dat$tropical), "of", nrow(dat), "\n")
+cat("Mean TEI in tropical:", mean(dat$TEI[dat$tropical == 1]), "\n")
+cat("Mean TEI in non-tropical:", mean(dat$TEI[dat$tropical == 0]), "\n")
+
+# Test interaction model with INLA
+stack_interaction <- inla.stack(
+  data = list(y = dat$TEI),
+  A = list(A, 1),
+  effects = list(
+    s = 1:spde$n.spde,
+    list(Intercept = 1,
+         temp_mean = dat$temp_mean,
+         rh_mean = dat$rh_mean,
+         veg_pc1 = dat$veg_pc1,
+         temp_rh = dat$temp_rh_interaction,
+         temp_veg = dat$temp_mean * dat$veg_pc1,
+         rh_veg = dat$rh_mean * dat$veg_pc1,
+         ruggedness = dat$ruggedness,
+         hfp = dat$hfp,
+         ses_mpd = dat$ses_mpd)
+  ),
+  tag = "est"
+)
+
+formula_interaction <- y ~ -1 + Intercept + 
+  temp_mean + rh_mean + veg_pc1 + 
+  temp_rh + temp_veg + rh_veg +
+  ruggedness + hfp + ses_mpd +
+  f(s, model = spde)
+
+model_interaction <- inla(
+  formula_interaction,
+  family = "gaussian",
+  data = inla.stack.data(stack_interaction),
+  control.predictor = list(A = inla.stack.A(stack_interaction), compute = TRUE),
+  control.compute = list(dic = TRUE, waic = TRUE),
+  control.inla = list(strategy = "adaptive", int.strategy = "eb", diagonal = 100),
+  verbose = FALSE
+)
+
+cat("\n=== INTERACTION MODEL RESULTS ===\n")
+cat("WAIC without interactions:", round(model_final$waic$waic, 2), "\n")
+cat("WAIC with interactions:", round(model_interaction$waic$waic, 2), "\n")
+cat("Improvement:", round(model_final$waic$waic - model_interaction$waic$waic, 2), "\n\n")
+
+print(model_interaction$summary.fixed[c("temp_rh", "temp_veg", "rh_veg"), c("mean", "0.025quant", "0.975quant")])
+```
+
+
+```{r}
+# ==== MODEL SUITE: MORE INTERACTIONS + COEFFICIENT PLOT ======================
+
+library(dplyr)
+library(ggplot2)
+library(forcats)
+library(tidyr)
+
+# 0) Preconditions --------------------------------------------------------------
+stopifnot(exists("A"), exists("spde"))
+if (!exists("listw_obj")) {
+  coords <- as.matrix(dat[, c("lon","lat")])
+  nb_obj <- spdep::knn2nb(spdep::knearneigh(coords, k = 8))
+  listw_obj <- spdep::nb2listw(nb_obj, style = "W", zero.policy = TRUE)
+}
+
+# Ensure centered/standardized z_* main effects exist (from chunk 1); else build
+center_unit <- function(x) as.numeric(scale(x))
+needed_main <- c("z_temp","z_rh","z_rug","z_hfp","z_veg","z_ses")
+if (!all(needed_main %in% names(dat))) {
+  dat <- dat %>%
+    mutate(
+      z_temp = center_unit(temp_mean),
+      z_rh   = center_unit(rh_mean),
+      z_rug  = center_unit(ruggedness),
+      z_hfp  = center_unit(hfp),
+      z_veg  = center_unit(veg_pc1),
+      z_ses  = center_unit(ses_mpd)
+    )
+}
+
+# 1) Generate candidate interaction/curvature terms ----------------------------
+dat <- dat %>%
+  mutate(
+    int_temp_rh    = z_temp * z_rh,
+    int_temp_veg   = z_temp * z_veg,
+    int_rh_veg     = z_rh   * z_veg,
+    int_temp_rh_veg= z_temp * z_rh * z_veg,   # three-way
+    int_hfp_veg    = z_hfp  * z_veg,          # anthropogenic × veg
+    int_rug_veg    = z_rug  * z_veg,          # topography × veg
+    z_temp2        = z_temp^2,
+    z_rh2          = z_rh^2,
+    z_veg2         = z_veg^2
+  )
+
+base_terms <- c("z_temp","z_rh","z_rug","z_hfp","z_ses")
+
+cands <- list(
+  list(name = "No vegetation",
+       terms = base_terms),
+  list(name = "Vegetation (main)",
+       terms = c(base_terms, "z_veg")),
+  list(name = "Veg × Temp",
+       terms = c(base_terms, "z_veg","int_temp_veg")),
+  list(name = "Veg × RH",
+       terms = c(base_terms, "z_veg","int_rh_veg")),
+  list(name = "Veg × (Temp + RH)",
+       terms = c(base_terms, "z_veg","int_temp_veg","int_rh_veg")),
+  list(name = "Climate synergy + Veg × climate",
+       terms = c(base_terms, "z_veg","int_temp_rh","int_temp_veg","int_rh_veg")),
+  list(name = "Three-way Trop × Veg",
+       terms = c(base_terms, "z_veg","int_temp_rh","int_temp_veg","int_rh_veg","int_temp_rh_veg")),
+  list(name = "Veg × Human Footprint",
+       terms = c(base_terms, "z_veg","int_hfp_veg")),
+  list(name = "Veg × Ruggedness",
+       terms = c(base_terms, "z_veg","int_rug_veg")),
+  list(name = "Quadratic climate + veg",
+       terms = c(base_terms, "z_veg","z_temp2","z_rh2","z_veg2")),
+  list(name = "Full",
+       terms = c(base_terms, "z_veg","int_temp_rh","int_temp_veg","int_rh_veg",
+                 "int_temp_rh_veg","int_hfp_veg","int_rug_veg"))
+)
+
+# 2) Fitter --------------------------------------------------------------------
+CTRL_PRED <- list(A = A, compute = TRUE)
+CTRL_COMP <- list(dic = TRUE, waic = TRUE, cpo = TRUE, config = TRUE)
+CTRL_INLA <- list(strategy = "adaptive", int.strategy = "eb", diagonal = 100)
+
+fit_spde_terms <- function(name, terms) {
+  terms <- unique(terms)
+  eff_fixed <- c("Intercept", terms)
+  stk <- INLA::inla.stack(
+    data    = list(y = dat$TEI),
+    A       = list(A, 1),
+    effects = list(
+      s = 1:spde$n.spde,
+      stats::setNames(object = cbind(Intercept = 1, as.data.frame(dat[, terms, drop = FALSE])),
+                      nm     = eff_fixed)
+    ),
+    tag     = "est"
+  )
+
+  form <- stats::as.formula(
+    paste("y ~ -1 + Intercept +", paste(terms, collapse = " + "), "+ f(s, model = spde)")
+  )
+
+  fit <- INLA::inla(form, family = "gaussian",
+                    data = INLA::inla.stack.data(stk),
+                    control.predictor = list(A = INLA::inla.stack.A(stk), compute = TRUE),
+                    control.compute   = CTRL_COMP,
+                    control.inla      = CTRL_INLA,
+                    verbose = FALSE)
+
+  idx <- INLA::inla.stack.index(stk, "est")$data
+  yhat <- fit$summary.fitted.values$mean[idx]
+  res  <- dat$TEI - yhat
+
+  # Metrics
+  waic <- unname(fit$waic$waic)
+  dic  <- unname(fit$dic$dic)
+  p_eff<- unname(fit$waic$p.eff)
+  lcpo <- -sum(log(pmax(fit$cpo$cpo[idx], .Machine$double.eps)), na.rm = TRUE)
+  cpo_fail <- mean(fit$cpo$failure[idx], na.rm = TRUE)
+  R2   <- 1 - var(res)/var(dat$TEI)
+  mi   <- spdep::moran.test(res, listw_obj, zero.policy = TRUE)
+
+  tib_metrics <- tibble(
+    model = name, WAIC = waic, DIC = dic, LCPO = lcpo, p_eff = p_eff,
+    CPO_fail = cpo_fail, R2 = R2, Morans_I = as.numeric(mi$estimate[1]),
+    p_Moran = as.numeric(mi$p.value)
+  )
+
+  tib_coefs <- as_tibble(fit$summary.fixed, rownames = "term") %>%
+    mutate(Model = name)
+
+  list(fit = fit, metrics = tib_metrics, coefs = tib_coefs)
+}
+
+# 3) Fit all candidates --------------------------------------------------------
+fits <- lapply(cands, function(m) fit_spde_terms(m$name, m$terms))
+
+metrics <- bind_rows(lapply(fits, `[[`, "metrics")) %>%
+  arrange(WAIC) %>%
+  mutate(Delta_WAIC = WAIC - min(WAIC),
+         Delta_LCPO = LCPO - min(LCPO))
+
+print(metrics)
+
+# 4) Coefficient plot across models -------------------------------------------
+# Keep a concise set of variables for readability; plot those present in any model
+keep_vars <- c("z_temp","z_rh","z_veg","z_rug","z_hfp","z_ses",
+               "int_temp_rh","int_temp_veg","int_rh_veg","int_temp_rh_veg",
+               "int_hfp_veg","int_rug_veg","z_temp2","z_rh2","z_veg2")
+
+label_map <- c(
+  z_temp="Temperature", z_rh="Relative Humidity", z_veg="Vegetation PC1",
+  z_rug="Terrain Ruggedness", z_hfp="Human Footprint", z_ses="Phylogenetic Diversity",
+  int_temp_rh="Temp × RH", int_temp_veg="Temp × Veg", int_rh_veg="RH × Veg",
+  int_temp_rh_veg="Temp × RH × Veg", int_hfp_veg="HFP × Veg", int_rug_veg="Ruggedness × Veg",
+  z_temp2="Temperature²", z_rh2="RH²", z_veg2="Vegetation²"
+)
+
+coefs_long <- bind_rows(lapply(fits, `[[`, "coefs")) %>%
+  filter(term %in% keep_vars) %>%
+  mutate(Variable = factor(label_map[term], levels = unique(label_map[keep_vars])),
+         Model = factor(Model, levels = metrics$model))  # order by WAIC
+
+# Horizontal forest with models in color
+coef_plot <- ggplot(coefs_long,
+                    aes(x = mean, y = Variable, color = Model)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey60") +
+  geom_errorbarh(aes(xmin = `0.025quant`, xmax = `0.975quant`),
+                 height = 0, position = position_dodge(width = 0.6)) +
+  geom_point(position = position_dodge(width = 0.6), size = 2) +
+  labs(title = "Fixed effects across candidate SPDE models",
+       x = "Coefficient (posterior mean with 95% CrI)", y = NULL) +
+  theme_minimal() +
+  theme(legend.position = "bottom",
+        panel.grid.major.y = element_line(color = "grey90"))
+
+print(coef_plot)
+
+# 5) Guidance for selection  ---------------------
+cat("\nModel selection guidance:\n",
+    "- Prefer smallest WAIC/LCPO. If ΔWAIC ≤ 2 (or ΔLCPO ≤ 2) from the minimum, treat models as statistically indistinguishable; choose the simpler one.\n",
+    "- Inspect p_eff and CPO_fail; avoid models with very large p_eff or any CPO failures.\n",
+    "- Use the coefficient plot to prioritize interpretability when information criteria are tied.\n")
+
+```
+
+```{r}
+# ==== 2) FIGURES — ROBUST, SELF-CHECKING =====================================
+library(sf)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(forcats)
+
+# --- Preconditions ------------------------------------------------------------
+# Verify that all required objects from the previous chunk exist
+if (!exists("mod_int")) {
+  stop("`mod_int` (interaction model from chunk 1) not found. Please run the previous chunk first.")
+}
+if (!exists("f_int") || !exists("stack_int") || !exists("ctrl_pred") || !exists("ctrl_inla")) {
+  stop("Objects `f_int`, `stack_int`, `ctrl_pred`, or `ctrl_inla` not found. Please run the previous chunk.")
+}
+
+# Ensure the model supports posterior sampling. If not, re-run it with the correct options.
+if (is.null(mod_int$misc$configs)) {
+  message("Re-running interaction model `mod_int` with `config = TRUE` to enable posterior sampling.")
+  mod_int <- INLA::inla(
+    f_int, family = "gaussian",
+    data = INLA::inla.stack.data(stack_int),
+    control.predictor = ctrl_pred,
+    control.compute   = list(dic = TRUE, waic = TRUE, cpo = TRUE, config = TRUE),
+    control.inla      = ctrl_inla,
+    verbose = FALSE
+  )
+}
+
+# Extract fixed effects summary and covariance matrix
+b_fix    <- mod_int$summary.fixed
+fe_names <- rownames(b_fix)          # Fixed-effect names as used by INLA
+SigmaF   <- mod_int$misc$cov.fixed   # Covariance matrix (may be NULL)
+
+# --- Helper Functions ---------------------------------------------------------
+# Build polygons from 1x1° cells (where lon/lat are lower-left corners)
+make_grid_sf <- function(df, cols) {
+  polys <- lapply(seq_len(nrow(df)), function(i) {
+    x <- df$lon[i]; y <- df$lat[i]
+    st_polygon(list(matrix(c(x,y, x+1,y, x+1,y+1, x,y+1, x,y), ncol=2, byrow=TRUE)))
+  })
+  st_sf(df[, cols, drop = FALSE], geometry = st_sfc(polys, crs = 4326))
+}
+
+# **CORRECTED FUNCTION**
+# Robustly draw from the posterior of fixed effects using the model's internal content map.
+# This is more reliable than matching rownames from the sample itself.
+get_fixed_draws <- function(mod, par_names, nsamp = 400, seed = 0L) {
+  contents <- mod$misc$configs$contents
+  if (is.null(contents)) {
+    stop("Model object does not contain `$misc$configs$contents`. Re-run model with `config=TRUE`.")
+  }
+
+  # Find the starting index for each parameter in the latent field
+  idx <- vapply(par_names, function(nm) {
+    i <- which(contents$tag == nm)
+    # If not found, try the backticked version `INLA` sometimes uses
+    if (length(i) == 0) i <- which(contents$tag == paste0("`", nm, "`"))
+    if (length(i) == 0) return(NA_integer_)
+    contents$start[i]
+  }, integer(1))
+
+  if (any(is.na(idx))) {
+    stop(sprintf("Not found in model's latent field map (`$misc$configs$contents$tag`): %s",
+                 paste(par_names[is.na(idx)], collapse = ", ")))
+  }
+  
+  samps <- INLA::inla.posterior.sample(nsamp, mod, seed = seed)
+  
+  # Extract the draws for the identified indices
+  M <- vapply(samps, function(s) as.numeric(s$latent[idx, 1]), numeric(length(idx)))
+  dim(M) <- c(length(idx), length(samps))
+  rownames(M) <- par_names
+  colnames(M) <- paste0("draw", seq_len(ncol(M)))
+  M
+}
+
+
+# Build a design matrix with columns EXACTLY matching a given set of term names
+build_X <- function(df, term_names) {
+  out <- matrix(0.0, nrow = nrow(df), ncol = length(term_names))
+  colnames(out) <- term_names
+  
+  put <- function(nm, val) if (nm %in% term_names) out[, nm] <<- val
+  
+  if ("Intercept" %in% term_names) put("Intercept", 1)
+  nm_in_df <- intersect(colnames(df), term_names)
+  if (length(nm_in_df)) out[, nm_in_df] <- as.matrix(df[, nm_in_df, drop = FALSE])
+  
+  if (all(c("z_temp", "z_rh") %in% colnames(df)))  put("int_temp_rh",  df$z_temp * df$z_rh)
+  if (all(c("z_temp", "z_veg") %in% colnames(df))) put("int_temp_veg", df$z_temp * df$z_veg)
+  if (all(c("z_rh", "z_veg") %in% colnames(df)))   put("int_rh_veg",   df$z_rh   * df$z_veg)
+  
+  out
+}
+
+# --- Define Vegetation Terms --------------------------------------------------
+need_deriv <- c("z_veg", "int_temp_veg", "int_rh_veg")
+if (!all(need_deriv %in% fe_names)) {
+  stop(sprintf("Expected vegetation terms not found in model: %s",
+               paste(setdiff(need_deriv, fe_names), collapse = ", ")))
+}
+G <- cbind(1, dat$z_temp, dat$z_rh)
+
+# ============================== Fig A: Marginal Vegetation Effect =========================================
+if (!is.null(SigmaF)) {
+  # Delta method
+  B <- b_fix[need_deriv, "mean"]
+  Sigma_sub <- as.matrix(SigmaF[need_deriv, need_deriv])
+  dmu_dveg_mean <- as.numeric(G %*% B)
+  dmu_dveg_se   <- sqrt(rowSums((G %*% Sigma_sub) * G))
+  prob_pos      <- pnorm(dmu_dveg_mean / pmax(dmu_dveg_se, .Machine$double.eps))
+} else {
+  # Sampling method
+  message("Using posterior sampling for Fig A as covariance matrix is unavailable.")
+  Beta_mat <- get_fixed_draws(mod_int, need_deriv, nsamp = 400, seed = 0L)
+  D <- G %*% Beta_mat
+  dmu_dveg_mean <- rowMeans(D)
+  dmu_dveg_se   <- apply(D, 1, sd)
+  prob_pos      <- rowMeans(D > 0)
+}
+
+sf_deriv <- make_grid_sf(dat %>% mutate(dmu_dveg = dmu_dveg_mean), "dmu_dveg")
+sf_prob  <- make_grid_sf(dat %>% mutate(prob_pos = prob_pos), "prob_pos")
+
+p_deriv <- ggplot(sf_deriv) +
+  geom_sf(aes(fill = dmu_dveg), color = NA) +
+  scale_fill_viridis_c(name = "∂μ/∂veg") +
+  labs(title = "Marginal Vegetation Effect (Posterior Mean)") +
+  theme_minimal()
+
+p_prob <- ggplot(sf_prob) +
+  geom_sf(aes(fill = prob_pos), color = NA) +
+  scale_fill_viridis_c(name = "P(∂μ/∂veg > 0)", limits = c(0,1)) +
+  labs(title = "Posterior Probability Vegetation Effect is Positive") +
+  theme_minimal()
+
+print(p_deriv); print(p_prob)
+
+# ============================== Fig B: Response Surface =========================================
+qRH   <- quantile(dat$z_rh, probs = c(0.1, 0.5, 0.9), na.rm = TRUE)
+labRH <- paste0("RH Quantile ", c("10th","50th","90th"))
+gr <- expand.grid(
+  z_temp = seq(-2.5, 2.5, length.out = 80),
+  z_veg  = seq(-2.5, 2.5, length.out = 80),
+  RH_lev = factor(labRH, levels = labRH)
+)
+gr$z_rh <- rep(as.numeric(qRH), each = 80*80)
+gr$z_rug <- 0; gr$z_hfp <- 0; gr$z_ses <- 0
+gr$Intercept <- 1
+
+X_gr     <- build_X(gr, fe_names)
+beta_f   <- b_fix[fe_names, "mean"]
+gr$TEI_hat <- as.numeric(X_gr %*% beta_f)
+
+p_surface <- ggplot(gr, aes(z_temp, z_veg, fill = TEI_hat)) +
+  geom_raster(interpolate = TRUE) +
+  facet_wrap(~ RH_lev, ncol = 3) +
+  scale_fill_viridis_c(name = "Predicted TEI\n(Fixed Effects)") +
+  labs(title = "TEI Response Surface", x = "Temperature (z-score)", y = "Vegetation PC1 (z-score)") +
+  theme_minimal()
+print(p_surface)
+
+# ============================== Fig C: Counterfactual Contribution =========================================
+X_obs     <- build_X(dat, fe_names)
+lp_with   <- as.numeric(X_obs %*% beta_f)
+
+X_noveg   <- X_obs
+for (nm in intersect(colnames(X_noveg), need_deriv)) X_noveg[, nm] <- 0
+lp_noveg  <- as.numeric(X_noveg %*% beta_f)
+
+sf_delta <- make_grid_sf(dat %>% mutate(delta_veg = lp_with - lp_noveg), "delta_veg")
+p_delta <- ggplot(sf_delta) +
+  geom_sf(aes(fill = delta_veg), color = NA) +
+  scale_fill_viridis_c(name = "Δ TEI") +
+  labs(title = "Counterfactual Vegetation Contribution (Conditional on Climate)") +
+  theme_minimal()
+print(p_delta)
+
+# ============================== Fig D: Simple Slopes =========================================
+veg_seq <- seq(-2.5, 2.5, length.out = 60)
+qT  <- quantile(dat$z_temp, probs = c(0.1, 0.5, 0.9), na.rm = TRUE)
+qRH <- quantile(dat$z_rh,   probs = c(0.1, 0.5, 0.9), na.rm = TRUE)
+
+newdat <- tidyr::crossing(
+  z_temp = as.numeric(qT),
+  z_rh   = as.numeric(qRH),
+  z_veg  = veg_seq
+) %>%
+  mutate(z_rug = 0, z_hfp = 0, z_ses = 0, Intercept = 1,
+         T_str  = factor(paste0("Temp q", c(10,50,90))[match(z_temp, qT)], levels=paste0("Temp q", c(10,50,90))),
+         RH_str = factor(paste0("RH q",   c(10,50,90))[match(z_rh,   qRH)], levels=paste0("RH q",   c(10,50,90))))
+
+X_new <- build_X(newdat, fe_names)
+
+if (!is.null(SigmaF)) {
+  mu_hat <- as.numeric(X_new %*% beta_f)
+  SigmaF_fe <- as.matrix(SigmaF[fe_names, fe_names])
+  se_hat <- sqrt(rowSums((X_new %*% SigmaF_fe) * X_new))
+  lo <- mu_hat - 1.96 * se_hat
+  hi <- mu_hat + 1.96 * se_hat
+} else {
+  message("Using posterior sampling for Fig D as covariance matrix is unavailable.")
+  Beta_all <- get_fixed_draws(mod_int, fe_names, nsamp = 400, seed = 0L)
+  MU <- X_new %*% Beta_all
+  mu_hat <- rowMeans(MU)
+  lo <- apply(MU, 1, quantile, 0.025)
+  hi <- apply(MU, 1, quantile, 0.975)
+}
+
+plotdf <- cbind(newdat, mu_hat = mu_hat, lo = lo, hi = hi)
+
+p_slope <- ggplot(plotdf, aes(z_veg, mu_hat, group = T_str, linetype = T_str)) +
+  geom_ribbon(aes(ymin = lo, ymax = hi, fill = T_str), alpha = 0.15, colour = NA) +
+  geom_line(linewidth = 0.9) +
+  facet_wrap(~ RH_str, ncol = 3) +
+  labs(title = "Simple Slopes: TEI vs. Vegetation at Climate Quantiles",
+       x = "Vegetation PC1 (z-score)", y = "Predicted TEI (Fixed Effects)",
+       linetype = "Temperature", fill = "Temperature") +
+  theme_minimal()
+print(p_slope)
+
+# ============================== Fig E: WAIC Comparison =========================================
+if (exists("waic_table")) {
+  waic_plot_df <- waic_table %>%
+    mutate(model = factor(model, levels = c("No vegetation", "Vegetation (main)", "Vegetation × climate")))
+  
+  p_waic <- ggplot(waic_plot_df, aes(x = model, y = Delta_vs_NoVeg)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+    geom_point(size = 3.5, color = "dodgerblue") +
+    geom_line(aes(group = 1), color = "dodgerblue", alpha = 0.5) +
+    labs(title = "Model Improvement (ΔWAIC) from Including Vegetation",
+         x = NULL, y = "ΔWAIC relative to 'No Vegetation' model\n(lower is better)") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 15, hjust = 1, size = 10))
+  print(p_waic)
+} else {
+  message("`waic_table` not found, skipping Fig E.")
+}
+```
+
+```{r}
+get_fixed_draws <- function(mod, par_names, nsamp = 400, seed = 0L) {
+  contents <- mod$misc$configs$contents
+  if (is.null(contents)) {
+    stop("Model object does not contain `$misc$configs$contents`. Re-run model with `config=TRUE`.")
+  }
+
+  # Find the starting index for each parameter in the latent field
+  idx <- vapply(par_names, function(nm) {
+    i <- which(contents$tag == nm)
+    # If not found, try the backticked version `INLA` sometimes uses
+    if (length(i) == 0) i <- which(contents$tag == paste0("`", nm, "`"))
+    if (length(i) == 0) return(NA_integer_)
+    contents$start[i]
+  }, integer(1))
+
+  if (any(is.na(idx))) {
+    stop(sprintf("Not found in model's latent field map (`$misc$configs$contents$tag`): %s",
+                 paste(par_names[is.na(idx)], collapse = ", ")))
+  }
+  
+  samps <- INLA::inla.posterior.sample(nsamp, mod, seed = seed)
+  
+  # Extract the draws for the identified indices
+  M <- vapply(samps, function(s) as.numeric(s$latent[idx, 1]), numeric(length(idx)))
+  dim(M) <- c(length(idx), length(samps))
+  rownames(M) <- par_names
+  colnames(M) <- paste0("draw", seq_len(ncol(M)))
+  M
+}
+```
+
+
+```{r}
+# ==== VEG × RH — FIXED EFFECTS + CLEAR SLOPES (Veg on x) + COUNTERFACTUAL MAP ====
+library(dplyr); library(tidyr); library(ggplot2); library(sf); library(forcats)
+
+# -- Preconditions --------------------------------------------------------------
+center_unit <- function(x) as.numeric(scale(x))
+if (!all(c("z_temp","z_rh","z_rug","z_hfp","z_veg","z_ses") %in% names(dat))) {
+  dat <- dat %>%
+    mutate(
+      z_temp = center_unit(temp_mean),
+      z_rh   = center_unit(rh_mean),
+      z_rug  = center_unit(ruggedness),
+      z_hfp  = center_unit(hfp),
+      z_veg  = center_unit(veg_pc1),
+      z_ses  = center_unit(ses_mpd)
+    )
+}
+dat <- dat %>% mutate(int_rh_veg = z_rh * z_veg)
+stopifnot(exists("A"), exists("spde"))
+
+# -- Fit (or reuse) Veg × RH model ---------------------------------------------
+get_model_vxr <- function() {
+  if (exists("model_vxr")) return(model_vxr)
+  terms <- c("z_temp","z_rh","z_rug","z_hfp","z_veg","z_ses","int_rh_veg")
+  stk <- INLA::inla.stack(
+    data    = list(y = dat$TEI),
+    A       = list(A, 1),
+    effects = list(
+      s = 1:spde$n.spde,
+      cbind(Intercept = 1, dat[, terms, drop = FALSE])
+    ),
+    tag     = "est"
+  )
+  form <- stats::as.formula(
+    paste("y ~ -1 + Intercept +", paste(terms, collapse = " + "), "+ f(s, model = spde)")
+  )
+  INLA::inla(form, family = "gaussian",
+             data = INLA::inla.stack.data(stk),
+             control.predictor = list(A = INLA::inla.stack.A(stk), compute = TRUE),
+             control.compute   = list(dic=TRUE, waic=TRUE, cpo=TRUE, config=TRUE),
+             control.inla      = list(strategy="adaptive", int.strategy="eb", diagonal=100),
+             verbose = FALSE)
+}
+model_vxr <- get_model_vxr()
+
+# -- Helpers -------------------------------------------------------------------
+build_X <- function(df, term_names) {
+  out <- matrix(0.0, nrow = nrow(df), ncol = length(term_names))
+  colnames(out) <- term_names
+  put <- function(nm, val) if (nm %in% term_names) out[, nm] <<- val
+  if ("Intercept" %in% term_names) put("Intercept", 1)
+  nm_df <- intersect(colnames(df), term_names)
+  if (length(nm_df)) out[, nm_df] <- as.matrix(df[, nm_df, drop = FALSE])
+  if (all(c("z_rh","z_veg") %in% colnames(df))) put("int_rh_veg", df$z_rh * df$z_veg)
+  out
+}
+make_grid_sf <- function(df, cols) {
+  polys <- lapply(seq_len(nrow(df)), function(i) {
+    x <- df$lon[i]; y <- df$lat[i]
+    st_polygon(list(matrix(c(x,y, x+1,y, x+1,y+1, x,y+1, x,y), ncol=2, byrow=TRUE)))
+  })
+  st_sf(df[, cols, drop = FALSE], geometry = st_sfc(polys, crs = 4326))
+}
+
+# ==================== (1) FIXED-EFFECTS FOREST PLOT (VERTICAL) ===========================
+fx <- as.data.frame(model_vxr$summary.fixed)
+fx$Variable <- rownames(fx)
+
+# Define human-readable labels for the variables
+label_map <- c(
+  Intercept = "Intercept",
+  z_temp = "Temperature", 
+  z_rh = "Relative Humidity", 
+  z_rug = "Terrain Ruggedness",
+  z_hfp = "Human Footprint", 
+  z_veg = "Vegetation", 
+  z_ses = "Phylogenetic Diversity",
+  int_rh_veg = "RH × Vegetation"
+)
+
+# Prepare the data frame for plotting
+plot_df <- fx %>%
+  dplyr::filter(Variable != "Intercept") %>%
+  dplyr::mutate(
+    # Use fct_reorder to sort variables by their coefficient mean for a clean look
+    Label = forcats::fct_reorder(label_map[Variable], mean, .desc = TRUE) ,
+    # Determine significance and direction for coloring
+    Sig = dplyr::case_when(
+      `0.025quant` > 0 | `0.975quant` < 0 ~ "Significant",
+      TRUE ~ "Non-significant"
+    ),
+    Dir = ifelse(mean > 0, "Positive", "Negative"),
+    Group = paste(Dir, Sig, sep = "_")
+  )
+
+# Create the vertical forest plot
+forest_vxr_vertical <- ggplot(plot_df, aes(x = Label, y = mean, ymin = `0.025quant`, ymax = `0.975quant`, color = Group)) +
+  # Add a horizontal line at y=0 for reference
+  geom_hline(yintercept = 0, linetype = "solid", colour = "grey50", linewidth = 0.6) +
+  # Add two error bar layers for a visual effect (thick/transparent + thin/opaque)
+  geom_errorbar(width = 0.00, linewidth = 3.2, alpha = 0.28) +
+  geom_errorbar(width = 0.35, linewidth = 1.15) +
+  # Add points for the mean estimates
+  geom_point(aes(fill = Group), shape = 21, size = 4.0, stroke = 1.2, colour = "white") +
+  # Define custom colors for the effect groups
+  scale_color_manual(
+    values = c(
+      "Positive_Significant" = "#2166AC", "Negative_Significant" = "#B2182B",
+      "Positive_Non-significant" = "#92C5DE", "Negative_Non-significant" = "#F4A582"
+    ),
+    guide = "none" # Hide the color legend
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Positive_Significant" = "#2166AC", "Negative_Significant" = "#B2182B",
+      "Positive_Non-significant" = "#92C5DE", "Negative_Non-significant" = "#F4A582"
+    ),
+    labels = c("Negative (p<0.05)", "Negative (n.s.)", "Positive (p<0.05)", "Positive (n.s.)"),
+    name = NULL # Hide the legend title
+  ) +
+  # Set axis labels
+  labs(y = "Estimated effects", x = NULL) +
+  # Apply a minimal theme with custom styling
+  theme_minimal(base_size = 28) +
+  theme(
+    legend.position = "bottom",
+    # Rotate x-axis text for readability
+    axis.text.x = element_text(angle = 60, hjust = 1, vjust = 1),
+    panel.grid.major.x = element_line(colour = "grey90"),
+    panel.grid.major.y = element_line(colour = "grey85", linetype = "dotted"),
+    plot.title = element_blank(),
+    plot.subtitle = element_blank()
+  ) +
+  # Adjust axis expansion to give points space
+  scale_y_continuous(expand = expansion(mult = c(0.12, 0.12))) +
+  scale_x_discrete(expand = expansion(mult = c(0.10, 0.12)))
+
+# Print the plot
+print(forest_vxr_vertical)
+
+# ==================== (2) SIMPLE SLOPES — TEI vs Vegetation (facets = RH) =====
+fe_names <- rownames(model_vxr$summary.fixed)
+beta_f   <- model_vxr$summary.fixed[fe_names, "mean"]
+SigmaF   <- model_vxr$misc$cov.fixed  # may be NULL; ribbons via sampling fallback
+
+veg_seq <- seq(-2.5, 2.5, length.out = 120)
+temp_q  <- quantile(dat$z_temp, probs = c(0.1,0.5,0.9), na.rm = TRUE)
+rh_q    <- quantile(dat$z_rh,   probs = c(0.1,0.5,0.9), na.rm = TRUE)
+
+newdat <- tidyr::crossing(
+  z_temp = as.numeric(temp_q),
+  z_rh   = as.numeric(rh_q),
+  z_veg  = veg_seq
+) %>%
+  mutate(
+    z_rug = 0, z_hfp = 0, z_ses = 0,
+    Temp  = factor(paste0("Temp q", c(10,50,90))[match(z_temp, temp_q)],
+                   levels = paste0("Temp q", c(10,50,90))),
+    RH    = factor(paste0("RH q",   c(10,50,90))[match(z_rh,   rh_q)],
+                   levels = paste0("RH q",   c(10,50,90))),
+    Intercept = 1
+  )
+
+X_new <- build_X(newdat, fe_names)
+
+# Mean prediction
+mu_hat <- as.numeric(X_new %*% beta_f)
+newdat$mu_hat <- mu_hat
+
+# Uncertainty: cov.fixed if available, else posterior sampling of fixed effects
+if (!is.null(SigmaF)) {
+  SigmaF_fe <- as.matrix(SigmaF[fe_names, fe_names])
+  se_hat <- sqrt(rowSums((X_new %*% SigmaF_fe) * X_new))
+  newdat$lo <- mu_hat - 1.96 * se_hat
+  newdat$hi <- mu_hat + 1.96 * se_hat
+} else {
+  Bdraws <- get_fixed_draws(model_vxr, fe_names, nsamp = 800, seed = 0L)
+  MU <- X_new %*% Bdraws
+  newdat$lo <- apply(MU, 1, quantile, 0.025)
+  newdat$hi <- apply(MU, 1, quantile, 0.975)
+}
+
+# Plot: x = Vegetation PC1 (z), y = TEI; one panel per RH; one line per Temp
+p_slope <- ggplot(newdat, aes(x = z_veg, y = mu_hat, group = Temp, linetype = Temp)) +
+  geom_ribbon(aes(ymin = lo, ymax = hi, fill = Temp), alpha = 0.12, colour = NA) +
+  geom_line(linewidth = 1.0, colour = "black") +
+  facet_wrap(~ RH, ncol = 3) +
+  labs(x = "Vegetation", y = "TEI") +
+  theme_minimal(base_size = 26) +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    panel.grid.major.x = element_line(colour="grey85", linetype="dotted"),
+    panel.grid.minor = element_blank(),
+    plot.title = element_blank(),
+    plot.subtitle = element_blank()
+  ) +
+  scale_x_continuous(limits = c(-2.5, 2.5))
+print(p_slope)
+
+# ==== FIGURE 3 — MARGINAL VEGETATION EFFECT MAP =================================
+library(dplyr); library(ggplot2); library(sf)
+
+# Use Veg×RH model if present; otherwise fall back to interaction model
+mod <- if (exists("model_vxr")) model_vxr else if (exists("mod_int")) mod_int else stop("No model found.")
+
+b_fix    <- mod$summary.fixed
+fe_names <- rownames(b_fix)
+SigmaF   <- mod$misc$cov.fixed  # may be NULL
+
+# Required terms for Veg×RH marginal effect
+need <- c("z_veg", "int_rh_veg")
+if (!all(need %in% fe_names)) {
+  stop(sprintf("Model does not contain required terms for Veg×RH marginal effect: %s",
+               paste(setdiff(need, fe_names), collapse = ", ")))
+}
+stopifnot(all(c("lon","lat","z_rh") %in% names(dat)))
+
+# --- Compute ∂μ/∂veg = β_veg + β_(veg×RH) * z_rh  ------------------------------
+beta_veg    <- b_fix["z_veg","mean"]
+beta_vxr    <- b_fix["int_rh_veg","mean"]
+dmu_mean    <- beta_veg + beta_vxr * dat$z_rh
+
+# Optional uncertainty if covariance is available
+if (!is.null(SigmaF)) {
+  S <- as.matrix(SigmaF[need, need])
+  # Var(β_veg + z_rh * β_vxr) = Var(β_veg) + z_rh^2 Var(β_vxr) + 2 z_rh Cov(β_veg, β_vxr)
+  var_dmu <- S["z_veg","z_veg"] + (dat$z_rh^2) * S["int_rh_veg","int_rh_veg"] +
+             2 * dat$z_rh * S["z_veg","int_rh_veg"]
+  se_dmu  <- sqrt(pmax(var_dmu, 0))
+  probpos <- pnorm(dmu_mean / pmax(se_dmu, .Machine$double.eps))
+} else {
+  se_dmu  <- NULL
+  probpos <- NULL
+}
+
+# --- Build 1×1° polygons and plot ---------------------------------------------
+make_grid_sf <- function(df, cols) {
+  polys <- lapply(seq_len(nrow(df)), function(i) {
+    x <- df$lon[i]; y <- df$lat[i]
+    st_polygon(list(matrix(c(x,y, x+1,y, x+1,y+1, x,y+1, x,y), ncol=2, byrow=TRUE)))
+  })
+  st_sf(df[, cols, drop = FALSE], geometry = st_sfc(polys, crs = 4326))
+}
+
+sf_me <- make_grid_sf(dat %>% mutate(dmu_dveg = dmu_mean), "dmu_dveg")
+
+p_me_map <- ggplot(sf_me) +
+  geom_sf(aes(fill = dmu_dveg), colour = NA) +
+  scale_fill_viridis_c(name = "∂TEI/∂veg") +
+  labs(x = NULL, y = NULL) +
+  theme_minimal(base_size = 16) +
+  theme(
+    legend.position = "right",
+    plot.title = element_blank(),
+    plot.subtitle = element_blank(),
+    panel.grid = element_blank()
+  )
+print(p_me_map)
+
+# (Optional) Probability map if covariance was available
+if (!is.null(probpos)) {
+  sf_pp <- make_grid_sf(dat %>% mutate(prob_pos = probpos), "prob_pos")
+  p_pp <- ggplot(sf_pp) +
+    geom_sf(aes(fill = prob_pos), colour = NA) +
+    scale_fill_viridis_c(name = "P(∂>0)", limits = c(0,1)) +
+    labs(x = NULL, y = NULL) +
+    theme_minimal(base_size = 16) +
+    theme(
+      legend.position = "right",
+      plot.title = element_blank(),
+      plot.subtitle = element_blank(),
+      panel.grid = element_blank()
+    )
+  print(p_pp)
+}
+```
+
+```{r}
+# Save the fixed-effects forest plot
+ggsave("forest_plot_vxr.svg", plot = forest_vxr_vertical, width = 5, height = 12, units = "in", dpi=600)
+
+# Save the simple slopes plot
+ggsave("simple_slopes_vxr.svg", plot = p_slope, width = 11, height = 6, units = "in", dpi=600)
+```
+
+```{r}
+# ==== SLOPE OF TEI WRT VEGETATION vs RELATIVE HUMIDITY (continuous RH + CI) ===
+# y = ∂TEI/∂Vegetation; x = z_RH. Uses posterior sampling of fixed effects if needed.
+
+library(dplyr); library(ggplot2); library(INLA)
+
+# --- Ensure model_vxr exists and supports posterior sampling -------------------
+stopifnot(exists("model_vxr"))
+
+if (is.null(model_vxr$misc$configs)) {
+  # Refit once with config=TRUE 
+  message("Refitting model_vxr with config=TRUE for posterior sampling of fixed effects.")
+  stopifnot(exists("A"), exists("spde"))
+  terms <- c("z_temp","z_rh","z_rug","z_hfp","z_veg","z_ses","int_rh_veg")
+  stk <- INLA::inla.stack(
+    data    = list(y = dat$TEI),
+    A       = list(A, 1),
+    effects = list(
+      s = 1:spde$n.spde,
+      cbind(Intercept = 1, dat[, terms, drop = FALSE])
+    ),
+    tag = "est"
+  )
+  f_vxr <- as.formula(paste("y ~ -1 + Intercept +",
+                            paste(terms, collapse = " + "), "+ f(s, model = spde)"))
+  model_vxr <- INLA::inla(
+    f_vxr, family = "gaussian",
+    data = INLA::inla.stack.data(stk),
+    control.predictor = list(A = INLA::inla.stack.A(stk), compute = TRUE),
+    control.compute   = list(dic=TRUE, waic=TRUE, cpo=TRUE, config=TRUE),
+    control.inla      = list(strategy="adaptive", int.strategy="eb", diagonal=100),
+    verbose = FALSE
+  )
+}
+
+# --- Robust sampler for fixed effects using the internal contents map ----------
+get_fixed_draws <- function(mod, par_names, nsamp = 1000, seed = 0L) {
+  contents <- mod$misc$configs$contents
+  if (is.null(contents)) stop("Model lacks `$misc$configs$contents` (need config=TRUE).")
+  idx <- vapply(par_names, function(nm) {
+    i <- which(contents$tag == nm)
+    if (!length(i)) i <- which(contents$tag == paste0("`", nm, "`"))
+    if (!length(i)) return(NA_integer_)
+    contents$start[i]
+  }, integer(1))
+  if (anyNA(idx)) stop("Not found in latent map: ", paste(par_names[is.na(idx)], collapse=", "))
+  samps <- INLA::inla.posterior.sample(nsamp, mod, seed = seed)
+  M <- vapply(samps, function(s) as.numeric(s$latent[idx, 1]), numeric(length(idx)))
+  dim(M) <- c(length(idx), length(samps))
+  rownames(M) <- par_names
+  M
+}
+
+# --- Slope curve dμ/d(z_veg) = β_veg + β_(veg×RH) * z_rh ----------------------
+b_fix <- model_vxr$summary.fixed
+need  <- c("z_veg","int_rh_veg")
+stopifnot(all(need %in% rownames(b_fix)))
+
+# RH grid over the central range
+rh_range <- quantile(dat$z_rh, probs = c(0.02, 0.98), na.rm = TRUE)
+rh_seq   <- seq(rh_range[1], rh_range[2], length.out = 400)
+
+# Mean slope from posterior means
+beta_v_mean <- b_fix["z_veg","mean"]
+beta_i_mean <- b_fix["int_rh_veg","mean"]
+slope_mean  <- beta_v_mean + beta_i_mean * rh_seq
+
+# Uncertainty via fixed-effect draws
+Bdraws <- get_fixed_draws(model_vxr, need, nsamp = 1500, seed = 1L)
+# rows: z_veg, int_rh_veg ; cols: draws
+beta_v_draw <- Bdraws["z_veg", ]
+beta_i_draw <- Bdraws["int_rh_veg", ]
+
+# For each draw j, slope(z) = beta_v_draw[j] + beta_i_draw[j] * z
+# Vectorize: make a matrix of slopes: n_z x n_draws
+SLOPES <- outer(rh_seq, beta_i_draw)         # z * beta_i_draw (n_z x n_draws)
+SLOPES <- sweep(SLOPES, 2, beta_v_draw, FUN = "+")  # add beta_v_draw per column
+
+slope_lo <- apply(SLOPES, 1, quantile, 0.025)
+slope_hi <- apply(SLOPES, 1, quantile, 0.975)
+
+# Quartile markers (25/50/75%)
+rh_quart <- as.numeric(quantile(dat$z_rh, probs = c(0.25, 0.50, 0.75), na.rm = TRUE))
+
+plotdf <- data.frame(z_rh = rh_seq, slope = slope_mean, lo = slope_lo, hi = slope_hi)
+
+# --- Plot (no title/subtitle, larger fonts); quartile verticals ---------------
+p_slope_curve <- ggplot(plotdf, aes(x = z_rh, y = slope)) +
+  geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.12, fill = "grey50") +
+  geom_line(linewidth = 1.2, colour = "black") +
+  geom_vline(xintercept = rh_quart, linetype = "dashed", colour = "grey60", linewidth = 0.7) +
+  geom_rug(data = data.frame(z_rh = dat$z_rh), aes(x = z_rh, y = NULL),
+           sides = "b", alpha = 0.25, colour = "grey40") +
+  labs(x = "Relative Humidity (z)", y = "Slope ∂TEI/∂Vegetation") +
+  theme_minimal(base_size = 18) +
+  theme(
+    legend.position = "none",
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_line(colour="grey85", linetype="dotted"),
+    plot.title = element_blank(),
+    plot.subtitle = element_blank()
+  )
+print(p_slope_curve)
+```
+
+```{r}
+# ==== VEG MAIN EFFECTS — FIXED EFFECTS + CLEAR SLOPES + MARGINAL EFFECT MAP ====
+library(dplyr); library(tidyr); library(ggplot2); library(sf); library(forcats)
+
+# -- Preconditions --------------------------------------------------------------
+center_unit <- function(x) as.numeric(scale(x))
+if (!all(c("z_temp","z_rh","z_rug","z_hfp","z_veg","z_ses") %in% names(dat))) {
+  dat <- dat %>%
+    mutate(
+      z_temp = center_unit(temp_mean),
+      z_rh   = center_unit(rh_mean),
+      z_rug  = center_unit(ruggedness),
+      z_hfp  = center_unit(hfp),
+      z_veg  = center_unit(veg_pc1),
+      z_ses  = center_unit(ses_mpd)
+    )
+}
+stopifnot(exists("A"), exists("spde"))
+
+# -- Fit (or reuse) Main Effects model -----------------------------------------
+get_model_main <- function() {
+  if (exists("model_main")) return(model_main)
+  terms <- c("z_temp","z_rh","z_rug","z_hfp","z_veg","z_ses")
+  stk <- INLA::inla.stack(
+    data    = list(y = dat$TEI),
+    A       = list(A, 1),
+    effects = list(
+      s = 1:spde$n.spde,
+      cbind(Intercept = 1, dat[, terms, drop = FALSE])
+    ),
+    tag     = "est"
+  )
+  form <- stats::as.formula(
+    paste("y ~ -1 + Intercept +", paste(terms, collapse = " + "), "+ f(s, model = spde)")
+  )
+  INLA::inla(form, family = "gaussian",
+             data = INLA::inla.stack.data(stk),
+             control.predictor = list(A = INLA::inla.stack.A(stk), compute = TRUE),
+             control.compute   = list(dic=TRUE, waic=TRUE, cpo=TRUE, config=TRUE),
+             control.inla      = list(strategy="adaptive", int.strategy="eb", diagonal=100),
+             verbose = FALSE)
+}
+model_main <- get_model_main()
+
+# -- Helpers -------------------------------------------------------------------
+build_X <- function(df, term_names) {
+  out <- matrix(0.0, nrow = nrow(df), ncol = length(term_names))
+  colnames(out) <- term_names
+  put <- function(nm, val) if (nm %in% term_names) out[, nm] <<- val
+  if ("Intercept" %in% term_names) put("Intercept", 1)
+  nm_df <- intersect(colnames(df), term_names)
+  if (length(nm_df)) out[, nm_df] <- as.matrix(df[, nm_df, drop = FALSE])
+  out
+}
+make_grid_sf <- function(df, cols) {
+  polys <- lapply(seq_len(nrow(df)), function(i) {
+    x <- df$lon[i]; y <- df$lat[i]
+    st_polygon(list(matrix(c(x,y, x+1,y, x+1,y+1, x,y+1, x,y), ncol=2, byrow=TRUE)))
+  })
+  st_sf(df[, cols, drop = FALSE], geometry = st_sfc(polys, crs = 4326))
+}
+
+# ==================== (1) FIXED-EFFECTS FOREST PLOT (VERTICAL) ===========================
+fx <- as.data.frame(model_main$summary.fixed)
+fx$Variable <- rownames(fx)
+
+# Define human-readable labels for the variables
+label_map <- c(
+  Intercept = "Intercept",
+  z_temp = "Temperature", 
+  z_rh = "Relative Humidity", 
+  z_rug = "Terrain Ruggedness",
+  z_hfp = "Human Footprint", 
+  z_veg = "Vegetation", 
+  z_ses = "Phylogenetic Diversity"
+)
+
+# Prepare the data frame for plotting
+plot_df <- fx %>%
+  dplyr::filter(Variable != "Intercept") %>%
+  dplyr::mutate(
+    # Use fct_reorder to sort variables by their coefficient mean for a clean look
+    Label = forcats::fct_reorder(label_map[Variable], abs(mean), .desc = TRUE) ,
+    # Determine significance and direction for coloring
+    Sig = dplyr::case_when(
+      `0.025quant` > 0 | `0.975quant` < 0 ~ "Significant",
+      TRUE ~ "Non-significant"
+    ),
+    Dir = ifelse(mean > 0, "Positive", "Negative"),
+    Group = paste(Dir, Sig, sep = "_")
+  )
+
+# Create the vertical forest plot
+forest_main_vertical <- ggplot(plot_df, aes(x = Label, y = mean, ymin = `0.025quant`, ymax = `0.975quant`, color = Group)) +
+  # Add a horizontal line at y=0 for reference
+  geom_hline(yintercept = 0, linetype = "solid", colour = "grey50", linewidth = 0.6) +
+  # Add two error bar layers for a visual effect (thick/transparent + thin/opaque)
+  geom_errorbar(width = 0.00, linewidth = 3.2, alpha = 0.28) +
+  geom_errorbar(width = 0.35, linewidth = 1.15) +
+  # Add points for the mean estimates
+  geom_point(aes(fill = Group), shape = 21, size = 4.0, stroke = 1.2, colour = "white") +
+  # Define custom colors for the effect groups
+  scale_color_manual(
+    values = c(
+      "Positive_Significant" = "#2166AC", "Negative_Significant" = "#B2182B",
+      "Positive_Non-significant" = "#92C5DE", "Negative_Non-significant" = "#F4A582"
+    ),
+    guide = "none" # Hide the color legend
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Positive_Significant" = "#2166AC", "Negative_Significant" = "#B2182B",
+      "Positive_Non-significant" = "#92C5DE", "Negative_Non-significant" = "#F4A582"
+    ),
+    labels = c("Negative (p<0.05)", "Negative (n.s.)", "Positive (p<0.05)", "Positive (n.s.)"),
+    name = NULL # Hide the legend title
+  ) +
+  # Set axis labels
+  labs(y = "Estimated effects", x = NULL) +
+  # Apply a minimal theme with custom styling
+  theme_minimal(base_size = 28) +
+  theme(
+    legend.position = "bottom",
+    # Rotate x-axis text for readability
+    axis.text.x = element_text(angle = 60, hjust = 1, vjust = 1),
+    panel.grid.major.x = element_line(colour = "grey90"),
+    panel.grid.major.y = element_line(colour = "grey85", linetype = "dotted"),
+    plot.title = element_blank(),
+    plot.subtitle = element_blank()
+  ) +
+  # Adjust axis expansion to give points space
+  scale_y_continuous(expand = expansion(mult = c(0.12, 0.12))) +
+  scale_x_discrete(expand = expansion(mult = c(0.10, 0.12)))
+
+# Print the plot
+print(forest_main_vertical)
+
+# ==================== (2) SIMPLE SLOPES — TEI vs Vegetation (facets = RH) =====
+fe_names <- rownames(model_main$summary.fixed)
+beta_f   <- model_main$summary.fixed[fe_names, "mean"]
+SigmaF   <- model_main$misc$cov.fixed  # may be NULL; ribbons via sampling fallback
+
+veg_seq <- seq(-2.5, 2.5, length.out = 120)
+temp_q  <- quantile(dat$z_temp, probs = c(0.1,0.5,0.9), na.rm = TRUE)
+rh_q    <- quantile(dat$z_rh,   probs = c(0.1,0.5,0.9), na.rm = TRUE)
+
+newdat <- tidyr::crossing(
+  z_temp = as.numeric(temp_q),
+  z_rh   = as.numeric(rh_q),
+  z_veg  = veg_seq
+) %>%
+  mutate(
+    z_rug = 0, z_hfp = 0, z_ses = 0,
+    Temp  = factor(paste0("Temp q", c(10,50,90))[match(z_temp, temp_q)],
+                   levels = paste0("Temp q", c(10,50,90))),
+    RH    = factor(paste0("RH q",   c(10,50,90))[match(z_rh,   rh_q)],
+                   levels = paste0("RH q",   c(10,50,90))),
+    Intercept = 1
+  )
+
+X_new <- build_X(newdat, fe_names)
+
+# Mean prediction
+mu_hat <- as.numeric(X_new %*% beta_f)
+newdat$mu_hat <- mu_hat
+
+# Uncertainty: cov.fixed if available, else posterior sampling of fixed effects
+if (!is.null(SigmaF)) {
+  SigmaF_fe <- as.matrix(SigmaF[fe_names, fe_names])
+  se_hat <- sqrt(rowSums((X_new %*% SigmaF_fe) * X_new))
+  newdat$lo <- mu_hat - 1.96 * se_hat
+  newdat$hi <- mu_hat + 1.96 * se_hat
+} else {
+  Bdraws <- get_fixed_draws(model_main, fe_names, nsamp = 800, seed = 0L)
+  MU <- X_new %*% Bdraws
+  newdat$lo <- apply(MU, 1, quantile, 0.025)
+  newdat$hi <- apply(MU, 1, quantile, 0.975)
+}
+
+# Plot: x = Vegetation PC1 (z), y = TEI; one panel per RH; one line per Temp
+p_slope <- ggplot(newdat, aes(x = z_veg, y = mu_hat, group = Temp, linetype = Temp)) +
+  geom_ribbon(aes(ymin = lo, ymax = hi, fill = Temp), alpha = 0.12, colour = NA) +
+  geom_line(linewidth = 1.0, colour = "black") +
+  facet_wrap(~ RH, ncol = 3) +
+  labs(x = "Vegetation", y = "TEI") +
+  theme_minimal(base_size = 26) +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    panel.grid.major.x = element_line(colour="grey85", linetype="dotted"),
+    panel.grid.minor = element_blank(),
+    plot.title = element_blank(),
+    plot.subtitle = element_blank()
+  ) +
+  scale_x_continuous(limits = c(-2.5, 2.5))
+print(p_slope)
+
+# ==== FIGURE 3 — MARGINAL VEGETATION EFFECT MAP =================================
+library(dplyr); library(ggplot2); library(sf)
+
+# Use main effects model
+mod <- model_main
+
+b_fix    <- mod$summary.fixed
+fe_names <- rownames(b_fix)
+SigmaF   <- mod$misc$cov.fixed  # may be NULL
+
+# Required terms for vegetation main effect
+need <- c("z_veg")
+if (!all(need %in% fe_names)) {
+  stop(sprintf("Model does not contain required terms for vegetation effect: %s",
+               paste(setdiff(need, fe_names), collapse = ", ")))
+}
+stopifnot(all(c("lon","lat") %in% names(dat)))
+
+# --- Compute ∂μ/∂veg = β_veg (constant across space) -------------------------
+beta_veg    <- b_fix["z_veg","mean"]
+dmu_mean    <- rep(beta_veg, nrow(dat))
+
+# Optional uncertainty if covariance is available
+if (!is.null(SigmaF)) {
+  var_dmu <- SigmaF["z_veg","z_veg"]
+  se_dmu  <- sqrt(var_dmu)
+  probpos <- pnorm(beta_veg / se_dmu)
+} else {
+  se_dmu  <- NULL
+  probpos <- NULL
+}
+
+# --- Build 1×1° polygons and plot ---------------------------------------------
+make_grid_sf <- function(df, cols) {
+  polys <- lapply(seq_len(nrow(df)), function(i) {
+    x <- df$lon[i]; y <- df$lat[i]
+    st_polygon(list(matrix(c(x,y, x+1,y, x+1,y+1, x,y+1, x,y), ncol=2, byrow=TRUE)))
+  })
+  st_sf(df[, cols, drop = FALSE], geometry = st_sfc(polys, crs = 4326))
+}
+
+sf_me <- make_grid_sf(dat %>% mutate(dmu_dveg = dmu_mean), "dmu_dveg")
+
+p_me_map <- ggplot(sf_me) +
+  geom_sf(aes(fill = dmu_dveg), colour = NA) +
+  scale_fill_viridis_c(name = "∂TEI/∂veg") +
+  labs(x = NULL, y = NULL) +
+  theme_minimal(base_size = 16) +
+  theme(
+    legend.position = "right",
+    plot.title = element_blank(),
+    plot.subtitle = element_blank(),
+    panel.grid = element_blank()
+  )
+print(p_me_map)
+
+# (Optional) Probability map if covariance was available
+if (!is.null(probpos)) {
+  sf_pp <- make_grid_sf(dat %>% mutate(prob_pos = rep(probpos, nrow(dat))), "prob_pos")
+  p_pp <- ggplot(sf_pp) +
+    geom_sf(aes(fill = prob_pos), colour = NA) +
+    scale_fill_viridis_c(name = "P(∂>0)", limits = c(0,1)) +
+    labs(x = NULL, y = NULL) +
+    theme_minimal(base_size = 16) +
+    theme(
+      legend.position = "right",
+      plot.title = element_blank(),
+      plot.subtitle = element_blank(),
+      panel.grid = element_blank()
+    )
+  print(p_pp)
+}
+```
+
+```{r}
+ggsave("forest_plot_main.svg", plot = forest_main_vertical, width = 5, height = 12, units = "in", dpi=600)
+```
+
+```{r}
+# ==== DISPLAY FIXED EFFECTS VALUES ====
+library(dplyr)
+
+# Extract fixed effects from the main effects model
+fx <- as.data.frame(model_main$summary.fixed)
+fx$Variable <- rownames(fx)
+
+# Define human-readable labels for the variables
+label_map <- c(
+  Intercept = "Intercept",
+  z_temp = "Temperature", 
+  z_rh = "Relative Humidity", 
+  z_rug = "Terrain Ruggedness",
+  z_hfp = "Human Footprint", 
+  z_veg = "Vegetation", 
+  z_ses = "Phylogenetic Diversity"
+)
+
+# Create a clean summary table
+fixed_effects_table <- fx %>%
+  mutate(
+    Label = label_map[Variable],
+    # Round values for cleaner display
+    Estimate = round(mean, 4),
+    Lower_CI = round(`0.025quant`, 4),
+    Upper_CI = round(`0.975quant`, 4),
+    # Create significance indicator
+    Significant = ifelse(`0.025quant` > 0 | `0.975quant` < 0, "***", ""),
+    # Create a formatted CI column
+    CI_95 = paste0("[", Lower_CI, ", ", Upper_CI, "]")
+  ) %>%
+  dplyr::select(Variable, Label, Estimate, CI_95, Significant) %>%
+  arrange(desc(abs(Estimate)))  # Order by effect size
+
+# Print the table
+cat("Fixed Effects Summary:\n")
+cat("=====================\n\n")
+print(fixed_effects_table, row.names = FALSE)
+
+# Alternative: Print with better formatting
+cat("\n\nFormatted Fixed Effects:\n")
+cat("========================\n")
+for(i in 1:nrow(fixed_effects_table)) {
+  row <- fixed_effects_table[i,]
+  cat(sprintf("%-20s: %7.4f %s %s\n", 
+              row$Label, 
+              row$Estimate, 
+              row$CI_95,
+              row$Significant))
+}
+
+# Quick significance summary
+sig_effects <- fixed_effects_table %>%
+  filter(Significant == "***") %>%
+  pull(Label)
+
+cat("\n\nSignificant effects (95% CI excludes zero):\n")
+cat("==========================================\n")
+if(length(sig_effects) > 0) {
+  for(effect in sig_effects) {
+    cat("-", effect, "\n")
+  }
+} else {
+  cat("No significant effects found.\n")
+}
+```
+
