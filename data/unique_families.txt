@@ -1,0 +1,122 @@
+family	category
+Pellorneidae (Ground Babblers and Allies)	Oscines
+Thamnophilidae (Typical Antbirds)	Non-Oscines
+Pycnonotidae (Bulbuls)	Oscines
+Parulidae (New World Warblers)	Oscines
+Tyrannidae (Tyrant Flycatchers)	Non-Oscines
+Malaconotidae (Bushshrikes and Allies)	Oscines
+Scotocercidae (Bush Warblers and Allies)	Oscines
+Icteridae (Troupials and Allies)	Oscines
+Furnariidae (Ovenbirds and Woodcreepers)	Non-Oscines
+Cisticolidae (Cisticolas and Allies)	Oscines
+Rhinocryptidae (Tapaculos)	Non-Oscines
+Notiomystidae (Stitchbird)	Oscines
+Turdidae (Thrushes and Allies)	Oscines
+Cotingidae (Cotingas)	Non-Oscines
+Muscicapidae (Old World Flycatchers)	Oscines
+Passeridae (Old World Sparrows)	Oscines
+Thraupidae (Tanagers and Allies)	Oscines
+Acanthizidae (Thornbills and Allies)	Oscines
+Petroicidae (Australasian Robins)	Oscines
+Troglodytidae (Wrens)	Oscines
+Peucedramidae (Olive Warbler)	Oscines
+Passerellidae (New World Sparrows)	Oscines
+Mimidae (Mockingbirds and Thrashers)	Oscines
+Remizidae (Penduline-Tits)	Oscines
+Leiothrichidae (Laughingthrushes and Allies)	Oscines
+Cardinalidae (Cardinals and Allies)	Oscines
+Paridae (Tits, Chickadees, and Titmice)	Oscines
+Motacillidae (Wagtails and Pipits)	Oscines
+Timaliidae (Tree-Babblers, Scimitar-Babblers, and Allies)	Oscines
+Eurylaimidae (Asian and Grauer's Broadbills)	Non-Oscines
+Phylloscopidae (Leaf Warblers)	Oscines
+Zosteropidae (White-eyes, Yuhinas, and Allies)	Oscines
+Sylviidae (Sylviid Warblers and Allies)	Oscines
+Alaudidae (Larks)	Oscines
+Campephagidae (Cuckooshrikes)	Oscines
+Grallariidae (Antpittas)	Non-Oscines
+Vireonidae (Vireos, Shrike-Babblers, and Erpornis)	Oscines
+Tityridae (Tityras and Allies)	Non-Oscines
+Nectariniidae (Sunbirds and Spiderhunters)	Oscines
+Icteriidae (Yellow-breasted Chat)	Oscines
+Pachycephalidae (Whistlers and Allies)	Oscines
+Acrocephalidae (Reed Warblers and Allies)	Oscines
+Corvidae (Crows, Jays, and Magpies)	Oscines
+Stenostiridae (Fairy Flycatchers)	Oscines
+Locustellidae (Grassbirds and Allies)	Oscines
+Vangidae (Vangas, Helmetshrikes, and Allies)	Oscines
+Polioptilidae (Gnatcatchers)	Oscines
+Monarchidae (Monarch Flycatchers)	Oscines
+Emberizidae (Old World Buntings)	Oscines
+Fringillidae (Finches, Euphonias, and Allies)	Oscines
+Dicruridae (Drongos)	Oscines
+Meliphagidae (Honeyeaters)	Oscines
+Hirundinidae (Swallows)	Oscines
+Oreoicidae (Australo-Papuan Bellbirds)	Oscines
+Certhiidae (Treecreepers)	Oscines
+Prunellidae (Accentors)	Oscines
+Sturnidae (Starlings)	Oscines
+Macrosphenidae (African Warblers)	Oscines
+Pipridae (Manakins)	Non-Oscines
+Machaerirhynchidae (Boatbills)	Non-Oscines
+Oriolidae (Old World Orioles)	Oscines
+Laniidae (Shrikes)	Oscines
+Regulidae (Kinglets)	Oscines
+Ptilonorhynchidae (Bowerbirds)	Oscines
+Ploceidae (Weavers and Allies)	Oscines
+Aegithinidae (Ioras)	Oscines
+Rhipiduridae (Fantails)	Oscines
+Chloropseidae (Leafbirds)	Oscines
+Cinclosomatidae (Quail-thrushes and Jewel-babblers)	Oscines
+Artamidae (Woodswallows, Bellmagpies, and Allies)	Oscines
+Platysteiridae (Wattle-eyes and Batises)	Oscines
+Rhodinocichlidae (Thrush-Tanager)	Oscines
+Atrichornithidae (Scrub-birds)	Non-Oscines
+Nicatoridae (Nicators)	Oscines
+Sittidae (Nuthatches)	Oscines
+Erythrocercidae (Yellow Flycatchers)	Oscines
+Pnoepygidae (Cupwings)	Oscines
+Dicaeidae (Flowerpeckers)	Oscines
+Pittidae (Pittas)	Non-Oscines
+Climacteridae (Australasian Treecreepers)	Oscines
+Paradisaeidae (Birds-of-Paradise)	Oscines
+Formicariidae (Antthrushes)	Non-Oscines
+Elachuridae (Spotted Elachura)	Non-Oscines
+Donacobiidae (Donacobius)	Oscines
+Modulatricidae (Dapple-throat and Allies)	Oscines
+Pardalotidae (Pardalotes)	Oscines
+Estrildidae (Waxbills and Allies)	Oscines
+Callaeidae (Wattlebirds)	Oscines
+Paradoxornithidae (Parrotbills)	Oscines
+Psophodidae (Whipbirds and Wedgebills)	Oscines
+Melanopareiidae (Crescentchests)	Non-Oscines
+Bernieridae (Malagasy Warblers)	Oscines
+Pomatostomidae (Pseudo-Babblers)	Oscines
+Zeledoniidae (Wrenthrush)	Oscines
+Spindalidae (Spindalises)	Oscines
+Maluridae (Fairywrens)	Oscines
+Conopophagidae (Gnateaters)	Non-Oscines
+Cinclidae (Dippers)	Oscines
+Melanocharitidae (Berrypeckers and Longbills)	Oscines
+Calyptomenidae (African and Green Broadbills)	Non-Oscines
+Calcariidae (Longspurs and Snow Buntings)	Oscines
+Aegithalidae (Long-tailed Tits)	Oscines
+Falcunculidae (Shrike-tits)	Oscines
+Oxyruncidae (Sharpbill)	Non-Oscines
+Viduidae (Indigobirds)	Oscines
+Orthonychidae (Logrunners)	Non-Oscines
+Menuridae (Lyrebirds)	Non-Oscines
+Mitrospingidae (Mitrospingid Tanagers)	Oscines
+Irenidae (Fairy-bluebirds)	Oscines
+Onychorhynchidae (Royal Flycatchers and Allies)	Non-Oscines
+Promeropidae (Sugarbirds)	Oscines
+Mohouidae (Whiteheads)	Oscines
+Bombycillidae (Waxwings)	Oscines
+Calyptophilidae (Chat-Tanagers)	Oscines
+Dasyornithidae (Bristlebirds)	Oscines
+Rhagologidae (Mottled Berryhunter)	Non-Oscines
+Urocynchramidae (Przevalski's Pinktail)	Oscines
+Tichodromidae (Wallcreeper)	Oscines
+Hyliidae (Hylias)	Oscines
+Pityriasidae (Bristlehead)	Oscines
+Eulacestomatidae (Ploughbill)	Non-Oscines

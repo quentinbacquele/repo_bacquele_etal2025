@@ -1,0 +1,3462 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+# Chunk 1: Setup - Load Libraries
+library(cluster)   # For daisy function (Gower distance)
+library(ape)       # For PCoA (Principal Coordinates Analysis)
+library(vegan)     # For envfit function
+library(ade4) 
+library(fastDummies) # For creating dummy variables (might still be useful for envfit interpretation)
+library(tidyr)
+library(stringr) # For str_extract
+library(forcats) # For factor reordering
+library(scales)
+library(pheatmap)
+library(knitr)
+library(broom)
+library(maps)      # For map coastlines (still used for geom_polygon)
+library(rlang)     # For working with quosures if needed (e.g., !!sym())
+library(viridis)   # For color scales
+library(sf)        # *** ADDED for spatial features ***
+library(brms)
+library(tidyverse) # Includes readr, dplyr, ggplot2, tibble
+```
+
+
+```{r}
+# Chunk 2: Load Data
+# Load the pre-processed dataset.
+# Set working directory to project root (adjust as needed)
+# setwd("path/to/project")
+data_file <- "./data/model_traits_morpho_social_data.csv"
+output_dir <- './output/model_species/'
+
+cat(paste("Loading data from:", data_file, "\n"))
+full_data <- readr::read_csv(data_file, show_col_types = FALSE, na = "NA")
+
+cat("Data loaded successfully. Displaying structure and head:\n")
+print(head(full_data))
+```
+```{r}
+# Chunk 3: Preprocessing - Define and Convert Variable Types
+# Define predictor and response columns. Convert types. Handle NAs more globally for PCoA.
+
+# Define ALL POTENTIAL CATEGORICAL PREDICTOR columns (including learners for later)
+all_categorical_predictors <- c("social_bond", "communal", "sexual_selection", "learners") 
+
+# Define NUMERIC PREDICTOR columns (Morphological - these will be scaled)
+numeric_morpho_predictors <- c("mass", "Beak.Length_Culmen", "Beak.Width", "Beak.Depth")
+
+# Define GMM RESPONSE columns (NOT used in this PCoA distance calculation)
+gmm_response_cols <- grep("^gmm_prob_.*_mean$", names(full_data), value = TRUE)
+
+# Define the primary species identifier
+species_id_col <- "species"
+
+# --- select Columns and Initial Processing ---
+# select all columns needed throughout the analysis, including learners
+data_processed <- full_data %>%
+  dplyr::select(all_of(c(species_id_col, all_categorical_predictors, numeric_morpho_predictors, gmm_response_cols))) %>% # Keep learners here
+  mutate(!!sym(species_id_col) := str_replace_all(!!sym(species_id_col), " ", "_")) %>%
+  filter(!duplicated(!!sym(species_id_col)), !is.na(!!sym(species_id_col))) %>%
+  # Convert categorical predictors to factors
+  mutate(across(any_of(all_categorical_predictors), as.factor)) %>% # Convert learners to factor too
+  # Convert numeric predictors and responses to numeric
+  mutate(across(any_of(c(numeric_morpho_predictors, gmm_response_cols)),
+                ~ suppressWarnings(as.numeric(as.character(.))))) %>%
+  # Set species names as rownames for distance/ordination later
+  column_to_rownames(var = species_id_col)
+
+cat("\nData types after initial conversion (including learners):\n")
+str(data_processed)
+
+# --- Define Predictors SPECIFICALLY FOR PCOA ---
+# Exclude 'learners' from the list used for Gower distance calculation
+pcoa_categorical_predictors <- setdiff(all_categorical_predictors, "learners")
+pcoa_all_predictor_cols <- c(pcoa_categorical_predictors, numeric_morpho_predictors)
+
+cat("\nPredictor columns used for PCoA distance calculation:\n"); print(pcoa_all_predictor_cols)
+cat("\nResponse columns defined:\n"); print(gmm_response_cols)
+
+# --- Handle Missing Data for PCoA Predictors ---
+# select ONLY the PCoA predictors from data_processed
+predictors_for_pcoa <- data_processed %>% dplyr::select(any_of(pcoa_all_predictor_cols))
+
+n_before_na_omit <- nrow(predictors_for_pcoa)
+data_pcoa_predictors_complete <- na.omit(predictors_for_pcoa) # This now excludes learners
+n_after_na_omit <- nrow(data_pcoa_predictors_complete)
+
+cat(paste("\nRemoved", n_before_na_omit - n_after_na_omit,
+          "rows with NA values in PCoA predictor columns.\nRetained", n_after_na_omit, "species for PCoA.\n"))
+
+if(n_after_na_omit < 5) {
+  stop("Insufficient complete data (<5 rows) after removing NAs from PCoA predictor columns. Cannot proceed.")
+}
+
+# --- Filter the FULL processed data and GMM responses to match the species kept for PCoA ---
+# This ensures data_processed_complete still contains 'learners' for the species we analyze
+species_kept_for_pcoa <- rownames(data_pcoa_predictors_complete)
+
+data_processed_complete <- data_processed %>%
+    filter(rownames(.) %in% species_kept_for_pcoa)
+    
+gmm_responses_complete <- data_processed_complete %>%
+    dplyr::select(any_of(gmm_response_cols)) %>%
+     # Ensure responses are numeric 
+     mutate(across(everything(), as.numeric))
+
+# Ensure the order matches for GMM responses
+gmm_responses_complete <- gmm_responses_complete[species_kept_for_pcoa, ]
+
+cat("Prepared complete predictor (for PCoA) and response matrices for", nrow(data_pcoa_predictors_complete), "species.\n")
+cat("The 'data_processed_complete' object retains 'learners' for these species.\n")
+# Check that learners is still present in data_processed_complete
+# print(head(data_processed_complete)) 
+```
+
+```{r}
+# Chunk 3c: Visualize Mean GMM Probabilities (Overall, Oscine, Non-Oscine) - FIXED CHECK
+
+cat("\n--- Chunk 3c: Visualizing Mean Acoustic Strategy Proportions (GMM Probabilities) - FIXED CHECK ---\n")
+
+
+
+# --- User-Defined Mappings and Order ---
+# 1. Strategy Names (Map from GMM Index 0-7)
+strategy_names <- c(
+    `0` = "Flat Whistles",
+    `1` = "Slow Trills",
+    `2` = "Fast Trills",
+    `3` = "Noisy Songs",
+    `4` = "Ultrafast Trills",
+    `5` = "Slow Modulated Whistles",
+    `6` = "Fast Modulated Whistles",
+    `7` = "Harmonic Stacks"
+)
+
+# 2. Desired Plotting Order for Strategies
+strategy_plot_order <- c(
+    "Harmonic Stacks",         # 7
+    "Slow Modulated Whistles", # 5
+    "Fast Modulated Whistles", # 6
+    "Slow Trills",             # 1
+    "Ultrafast Trills",        # 4
+    "Fast Trills",             # 2
+    "Noisy Songs",             # 3
+    "Flat Whistles"            # 0
+)
+
+# 3. USE USER'S DEFINED COLORS - Corrected and Completed
+response_color_map_table_user <- c(
+    "Flat Whistles" = '#785EF0',
+    "Slow Trills" = '#E69F00',
+    "Fast Trills" = '#009E73',
+    "Ultrafast Trills" = '#0072B2',
+    "Slow Modulated Whistles" = '#D55E00',
+    "Fast Modulated Whistles" = '#CC79A7',
+    "Harmonic Stacks" = '#444444',
+    "Noisy Songs" = '#DC267F' # Added missing color
+)
+
+# Assign the final, complete map to the variable we use later
+strategy_colors <- response_color_map_table_user
+
+# *** CORRECTED Error Check ***
+# Check if all strategy NAMES defined in strategy_names exist as NAMES in the color map
+defined_strategy_names <- unique(unname(strategy_names)) # Get the actual names like "Flat Whistles"
+color_map_names <- names(strategy_colors)
+
+if (length(strategy_colors) != length(defined_strategy_names)) {
+    stop(paste("The number of colors defined (", length(strategy_colors),
+               ") does not match the number of unique strategy names (", length(defined_strategy_names), ")."))
+}
+if (!all(defined_strategy_names %in% color_map_names)) {
+     missing_names <- setdiff(defined_strategy_names, color_map_names)
+     stop(paste("The following strategy names are missing from the color map keys:",
+                paste(shQuote(missing_names), collapse=", "))) # Use shQuote for clarity
+}
+# Check the reverse too (optional but good practice)
+if (!all(color_map_names %in% defined_strategy_names)) {
+     extra_names <- setdiff(color_map_names, defined_strategy_names)
+     warning(paste("The color map contains names not found in strategy_names:",
+                   paste(shQuote(extra_names), collapse=", ")))
+}
+
+
+cat("Strategy names, order, and USER-DEFINED colors defined and verified.\n")
+# print(strategy_colors[strategy_plot_order]) # Optional check
+
+# --- Check for Required Data ---
+# (Code remains the same)
+if (!exists("data_processed")) { stop("Object 'data_processed' not found.") }
+if (!exists("gmm_responses_complete")) { stop("Object 'gmm_responses_complete' not found.") }
+if (!"learners" %in% names(data_processed)) { stop("The 'learners' column is not found.") }
+
+# --- Prepare Data for Summary ---
+# (Code remains the same - using "Non-Oscines", "Oscines" factors)
+# 1. Get Learner Status
+learner_status_raw <- data_processed %>%
+  rownames_to_column(var = "species") %>% dplyr::select(species, learners)
+learner_status <- learner_status_raw %>%
+    mutate(learners = factor(learners, levels = c("Non-Oscines", "Oscines"))) %>%
+    filter(!is.na(learners))
+
+# 2. Get GMM Probabilities
+gmm_data <- gmm_responses_complete %>% rownames_to_column(var = "species")
+
+# 3. Combine Learner Status and GMM Probabilities
+combined_gmm_data <- inner_join(learner_status, gmm_data, by = "species")
+cat(paste("Combined GMM data and learner status for", nrow(combined_gmm_data), "species using INNER JOIN.\n"))
+if (nrow(combined_gmm_data) == 0) { stop("No overlapping species found.") }
+
+# --- Reshape and Calculate Means ---
+# (Code remains the same)
+# 1. Pivot GMM data to long format
+gmm_long <- combined_gmm_data %>%
+  pivot_longer(cols = starts_with("gmm_prob_"), names_to = "GMM_Variable", values_to = "Probability") %>%
+  mutate(GMM_Index = as.numeric(str_extract(GMM_Variable,"(?<=gmm_prob_)[0-7](?=_mean)")),
+         StrategyName = strategy_names[as.character(GMM_Index)]) %>%
+  filter(!is.na(StrategyName))
+
+# 2. Calculate Means for Learner Groups
+mean_probs_learners <- gmm_long %>%
+  group_by(learners, StrategyName) %>%
+  summarise(MeanProbability = mean(Probability, na.rm = TRUE), .groups = "drop") %>%
+  mutate(Group = case_when(learners == "Non-Oscines" ~ "Non-Oscine (Learners=0)",
+                           learners == "Oscines"     ~ "Oscine (Learners=1)", TRUE ~ NA_character_ )) %>%
+  filter(!is.na(Group)) %>% dplyr::select(Group, StrategyName, MeanProbability)
+
+# 3. Calculate Means Overall
+mean_probs_overall <- gmm_long %>%
+  group_by(StrategyName) %>% summarise(MeanProbability = mean(Probability, na.rm = TRUE), .groups = "drop") %>%
+  mutate(Group = "Overall") %>% dplyr::select(Group, StrategyName, MeanProbability)
+
+# 4. Combine all available mean probabilities
+summary_list <- list()
+if(exists("mean_probs_overall") && nrow(mean_probs_overall) > 0) { summary_list[["Overall"]] <- mean_probs_overall }
+if(exists("mean_probs_learners") && nrow(mean_probs_learners) > 0) { summary_list[["Learners"]] <- mean_probs_learners }
+
+if (length(summary_list) > 0) {
+    mean_probs_combined <- bind_rows(summary_list) %>%
+        mutate(
+            StrategyName = factor(StrategyName, levels = strategy_plot_order),
+            Group = factor(Group, levels = intersect(c("Overall", "Oscine (Learners=1)", "Non-Oscine (Learners=0)"), unique(.$Group))) ) %>%
+        arrange(Group, StrategyName)
+    cat("\nFinal data prepared for plotting. Groups present:", paste(levels(mean_probs_combined$Group), collapse=", "), "\n")
+} else {
+    mean_probs_combined <- data.frame()
+    cat("\nWARNING: No mean probability summaries could be generated.\n")
+}
+
+
+# --- Create the Faceted Bar Plot ---
+# Check if there's data to plot AND if there are multiple groups to facet
+if (nrow(mean_probs_combined) > 0 && length(unique(mean_probs_combined$Group)) > 0) {
+
+    plot_gmm_means_faceted <- ggplot(mean_probs_combined,
+                                     aes(x = StrategyName, y = MeanProbability, fill = StrategyName)) +
+      geom_col(color="black", alpha=0.9, width = 0.8) +
+      # *** CHANGE HERE: Use scales = "fixed" to sync y-axes ***
+      facet_grid(Group ~ ., scales = "fixed", switch = "y") +
+      scale_fill_manual(values = strategy_colors, guide = "none") +
+      # *** CHANGE HERE: Set explicit limits and breaks for y-axis ***
+      scale_y_continuous(
+          labels = scales::percent_format(accuracy = 1),
+          limits = c(0, 0.25), # Set max limit to 25%
+          breaks = seq(0, 0.25, by = 0.05), # Adjust breaks for the new range
+          expand = expansion(mult = c(0, 0)) # Start exactly at 0
+          ) +
+      labs(
+        title = "Mean Acoustic Strategy Composition",
+        x = "Acoustic Strategy",
+        y = "Mean Proportion" ) +
+      theme_minimal(base_size = 11) +
+      theme(
+          strip.text.y.left = element_text(face = "bold", size=10, angle = 0),
+          strip.placement = "outside",
+          axis.text.x = element_text(angle = 45, hjust = 1, size = 9, face="bold"),
+          axis.text.y = element_text(size=9),
+          axis.title.x = element_text(margin = margin(t = 10), size=10, face="bold"),
+          axis.title.y = element_text(size=10, face="bold"),
+          panel.grid.major.x = element_blank(),
+          panel.grid.minor.y = element_blank(),
+          panel.grid.major.y = element_line(color = "grey85"),
+          plot.title = element_text(hjust = 0.5, size=12, face="bold"),
+          panel.spacing = unit(1.5, "lines")
+          )
+
+    print(plot_gmm_means_faceted)
+
+    # Optionally save the plot with a new name indicating fixed scale
+    output_dir_plots <- './output/model_species/'
+    if (!dir.exists(output_dir_plots)) dir.create(output_dir_plots, recursive = TRUE)
+    ggsave(file.path(output_dir_plots, "plot_mean_gmm_probabilities_by_group_fixed_y25.jpg"), plot_gmm_means_faceted, width = 6, height = 8, dpi = 300) # Changed filename
+
+    cat("\n--- Mean GMM Probability Visualization Complete (Fixed Y-axis at 25%) ---\n")
+
+} else {
+    cat("\n--- PLOT SKIPPED: No combined data available or insufficient groups after processing means. ---\n")
+}
+```
+
+
+```{r}
+# Chunk 4: Scale Numeric Predictors (for Gower & Interpretation)
+# Scale only the numeric *predictor* columns in the complete dataset.
+
+numeric_morpho_predictors_present <- intersect(numeric_morpho_predictors, names(data_pcoa_predictors_complete))
+
+cat(paste("\nScaling the following numeric predictor columns:\n", paste(numeric_morpho_predictors_present, collapse=", "), "\n"))
+
+# Create a copy to store scaled data
+data_pcoa_predictors_scaled <- data_pcoa_predictors_complete
+
+if(length(numeric_morpho_predictors_present) > 0) {
+  # Scale only the numeric columns, keeping factors as they are
+  scaled_numeric_data <- scale(data_pcoa_predictors_complete[, numeric_morpho_predictors_present],
+                               center = TRUE, scale = TRUE)
+
+  # Convert back to data frame and combine with factors
+  scaled_numeric_df <- as.data.frame(scaled_numeric_data)
+  rownames(scaled_numeric_df) <- rownames(data_pcoa_predictors_complete) # Preserve species rownames
+
+  # Replace original numeric columns with scaled versions
+  data_pcoa_predictors_scaled <- data_pcoa_predictors_complete %>%
+    dplyr::select(-all_of(numeric_morpho_predictors_present)) %>% # Remove original numeric cols
+    bind_cols(scaled_numeric_df) # Add scaled numeric cols
+
+  cat("Numeric predictor data scaled. Head of prepared data for PCoA:\n")
+  print(head(data_pcoa_predictors_scaled))
+
+} else {
+  cat("No numeric morphological columns found to scale.\n")
+  # data_pcoa_predictors_scaled already holds the unscaled complete data
+}
+```
+
+```{r}
+# Chunk 5: Calculate Gower Distance
+# Calculate Gower distance on the (potentially scaled) mixed predictor data.
+
+cat("\nCalculating Gower distance matrix...\n")
+
+# Use the data prepared in the previous step (numeric scaled, factors intact)
+# Ensure the data frame only contains predictor columns used for distance
+distance_matrix_gower <- cluster::daisy(data_pcoa_predictors_scaled, metric = "gower")
+
+# Check if distance calculation was successful
+if (inherits(distance_matrix_gower, "dist")) {
+    cat("Gower distance matrix calculated successfully.\n")
+    # summary(distance_matrix_gower) # Optional: view summary
+} else {
+    stop("Failed to calculate Gower distance matrix.")
+}
+```
+
+```{r}
+# --- REVISED CHUNK 6 (incorporating scaling) ---
+# Chunk 6: Perform PCoA using ade4::dudi.pco and Scale Axes
+
+cat("\nPerforming PCoA on Gower distance matrix using ade4::dudi.pco...\n")
+pcoa_result_ade4 <- NULL # Using ade4 terminology now
+pcoa_axes_ade4 <- NULL   # Store FINAL (scaled) axes here
+
+# dudi.pco requires the distance matrix directly
+if (inherits(distance_matrix_gower, "dist")) {
+
+    pcoa_result_ade4 <- tryCatch({
+        # scannf=FALSE prevents interactive selection of axes
+        # nf = number of axes to keep (set high initially, e.g., 10 or more if needed)
+        # tolerance = sets tolerance for eigenvalues, might help with Gower issues
+        # tol = 1e-07 is default
+        ade4::dudi.pco(d = distance_matrix_gower, scannf = FALSE, nf = 10, full = TRUE, tol = 1e-7) # Keep 10 axes for inspection, 'full' for eigenvalues
+    }, error = function(e) {
+        cat("Error during ade4::dudi.pco calculation:", e$message, "\n")
+        NULL
+    })
+
+    if (!is.null(pcoa_result_ade4)) {
+        cat("ade4::dudi.pco completed.\n")
+
+        # Display summary of PCoA results (eigenvalues)
+        eigenvalues_ade4 <- pcoa_result_ade4$eig
+        variance_explained_ade4 <- eigenvalues_ade4 / sum(pmax(0, eigenvalues_ade4)) # Use pmax for safety with potential negatives
+        cum_variance_ade4 <- cumsum(variance_explained_ade4)
+
+        eigen_summary_ade4 <- data.frame(
+            Axis = 1:length(eigenvalues_ade4),
+            Eigenvalue = eigenvalues_ade4,
+            Variance_Proportion = variance_explained_ade4,
+            Cumulative_Variance = cum_variance_ade4
+        )
+
+        cat("\nEigenvalue Summary (ade4):\n")
+        print(head(eigen_summary_ade4, 10)) # Show first 10
+
+        if(any(eigenvalues_ade4 < -1e-8)) {
+            cat("\nWarning: Negative eigenvalues detected. This can occur with non-Euclidean distances like Gower.\n")
+            cat("         Interpret higher axes with caution. ade4 might have applied corrections implicitly.\n")
+        }
+
+        # --- Extract principal coordinates ---
+        num_axes_to_extract = 5 # Adjust as needed
+        if (!is.null(pcoa_result_ade4$li) && ncol(pcoa_result_ade4$li) >= num_axes_to_extract) {
+
+            # Select first N axes from the $li dataframe
+            pcoa_axes_ade4_raw <- pcoa_result_ade4$li[, 1:num_axes_to_extract, drop = FALSE]
+
+            # Rename columns consistently
+            colnames(pcoa_axes_ade4_raw) <- paste0("PCoA", 1:num_axes_to_extract)
+
+            # Add species names back from rownames
+            pcoa_axes_ade4_raw <- pcoa_axes_ade4_raw %>% rownames_to_column(var = "species")
+
+            cat(paste("\nHead of first", num_axes_to_extract, "RAW PCoA axes (ade4):\n"))
+            print(head(pcoa_axes_ade4_raw))
+
+            # --- SCALE THE PCOA AXES ---
+            cat("\nScaling the extracted PCoA axes (mean=0, sd=1)...\n")
+            pcoa_axes_ade4 <- pcoa_axes_ade4_raw %>%
+                 mutate(across(starts_with("PCoA"), ~ as.vector(scale(.x)))) # Use scale() and convert back to vector
+
+            # Verify scaling (optional but recommended)
+            scaled_summary <- pcoa_axes_ade4 %>%
+                summarise(across(starts_with("PCoA"), list(mean = mean, sd = sd), na.rm = TRUE))
+            cat("Summary statistics of SCALED PCoA axes:\n")
+            print(scaled_summary) # Means should be ~0, SDs should be ~1
+
+            cat("PCoA axes scaled successfully.\n")
+            cat("\nHead of FINAL (SCALED) PCoA axes:\n")
+            print(head(pcoa_axes_ade4))
+            # --- END SCALING ---
+
+        } else {
+             cat(paste("Warning: PCoA vectors ($li) not available or have fewer than", num_axes_to_extract, "dimensions. Cannot scale.\n"))
+             pcoa_axes_ade4 <- NULL # Keep this NULL assignment if extraction fails
+        }
+    } else {
+        cat("ade4::dudi.pco calculation failed.\n")
+        pcoa_axes_ade4 <- NULL # Ensure it's NULL if PCoA failed
+    }
+
+} else {
+     cat("\nSkipping PCoA: Gower distance matrix not available.\n")
+     pcoa_result_ade4 <- NULL
+     pcoa_axes_ade4 <- NULL # Ensure it's NULL here too
+}
+
+# --- Scree Plot Generation (Chunk 6b) would go here, using pcoa_result_ade4$eig ---
+# Note: The scree plot uses eigenvalues, which are NOT affected by scaling the axes scores.
+```
+
+```{r}
+# Chunk 6b: Generate Scree Plot for PCoA (using ade4 results)
+
+if (!is.null(pcoa_result_ade4) && !is.null(pcoa_result_ade4$eig)) {
+    cat("\n--- Generating Scree Plot (Bar Plot Style) for ade4 PCoA Eigenvalues ---\n")
+
+    # Extract eigenvalues and calculate percentage variance explained
+    eigenvalues_ade4 <- pcoa_result_ade4$eig
+    # Handle potential negative eigenvalues before calculating proportions
+    eigenvalues_ade4_pos <- pmax(eigenvalues_ade4, 0) # Treat negatives as zero for variance %
+    variance_explained_ade4 <- eigenvalues_ade4_pos / sum(eigenvalues_ade4_pos)
+    eigenvalues_df <- data.frame(
+            Eigenvalue = eigenvalues_ade4, # Store original eigenvalues too
+            Variance_Explained = variance_explained_ade4,
+            Percent_Variance = variance_explained_ade4 * 100,
+            Axis = 1:length(eigenvalues_ade4) # Keep Axis NUMERIC
+           )
+
+    # Limit axes to plot
+    num_species = nrow(pcoa_result_ade4$li) # Get N from scores
+    max_axes_possible = num_species - 1
+    max_axes_to_plot <- min(30, max_axes_possible, nrow(eigenvalues_df))
+    scree_data_plot <- eigenvalues_df[1:max_axes_to_plot, ]
+
+    cat(paste("Plotting variance explained for first", max_axes_to_plot,"axes.\n"))
+
+    # --- Create the base scree bar plot ---
+    p_base <- ggplot(scree_data_plot, aes(x = Axis)) +
+        geom_col(aes(y = Percent_Variance), fill = "dodgerblue", color="grey30", alpha=0.8) + # Map y here
+        scale_y_continuous(name = "Percentage Variance Explained (%)") +
+        scale_x_continuous(
+              name = "PCoA Axis Number",
+              breaks = seq(0, max_axes_to_plot, by = ifelse(max_axes_to_plot > 20, 5, 2)),
+              limits = c(0.5, max_axes_to_plot + 0.5)
+              ) +
+        labs(
+            title = "PCoA Scree Plot (Gower Distance, ade4::dudi.pco)",
+            subtitle = paste("Variance explained by the first", max_axes_to_plot,"axes")
+        ) +
+        theme_minimal() +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+    cat("\nDisplaying basic scree bar plot:\n")
+    print(p_base) # Print basic plot
+
+    # --- Add broken stick comparison ---
+    cat("\nCalculating and adding Broken Stick comparison...\n")
+    broken_stick_values <- tryCatch({
+         # Use max_axes_possible based on N species
+         vegan::bstick(max_axes_possible) * 100
+    }, error = function(e){ cat("Warning: Failed to calculate broken stick values -", e$message, "\n"); NULL })
+
+    if (!is.null(broken_stick_values)) {
+        bstick_subset <- broken_stick_values[1:nrow(scree_data_plot)]
+        scree_data_plot$Broken_Stick_Percent <- bstick_subset
+
+        # Add line/points for broken stick TO THE BAR PLOT
+        p_scree_bar_bstick <- p_base +
+            geom_line(data = scree_data_plot, aes(x = Axis, y = Broken_Stick_Percent),
+                      color = "red", linetype = "dashed") +
+            geom_point(data = scree_data_plot, aes(x = Axis, y = Broken_Stick_Percent),
+                       color = "red", shape = 4, size=2) +
+            labs(subtitle = paste("Variance explained by first", max_axes_to_plot,"axes (Blue=PCoA, Red=Broken Stick)"))
+
+        cat("\nDisplaying scree bar plot with Broken Stick comparison (Keep bars taller than red crosses):\n")
+        print(p_scree_bar_bstick)
+    } else {
+        cat("Skipping broken stick overlay.\n")
+    }
+
+} else {
+    cat("\nCannot generate scree plot: ade4 PCoA results ($eig) are not available.\n")
+}
+```
+
+```{r}
+# Chunk 7: Analyze PCoA Axes vs. Original Variables (using envfit on ade4 results)
+
+envfit_result_5d <- NULL # Initialize result variable
+
+# Use pcoa_axes_ade4 which contains the scores
+if (!is.null(pcoa_axes_ade4)) {
+    # Use the same logic to determine axes_to_use
+    num_available_axes <- ncol(pcoa_axes_ade4) - 1
+    axes_to_use <- min(5, num_available_axes)
+
+    if (axes_to_use >= 2) {
+        cat(paste("\nRelating original predictor variables to the first", axes_to_use, "PCoA axes (ade4) using envfit...\n"))
+
+        # Prepare predictors (ensure rownames match the pcoa_axes_ade4 species order)
+        original_predictors_for_envfit <- data_pcoa_predictors_complete[pcoa_axes_ade4$species, , drop = FALSE]
+
+        # --- Prepare PCoA scores from ade4 results ---
+        pcoa_scores_for_envfit <- pcoa_axes_ade4 %>%
+            dplyr::select(all_of(paste0("PCoA", 1:axes_to_use))) # select columns PCoA1 to PCoAx
+
+        # Run envfit
+        envfit_result_5d <- tryCatch({
+            vegan::envfit(pcoa_scores_for_envfit, original_predictors_for_envfit,
+                          permutations = 999, na.rm = TRUE)
+        }, error = function(e) { cat("Error during envfit calculation:", e$message, "\n"); NULL })
+
+        if (!is.null(envfit_result_5d)) {
+            cat("envfit analysis completed.\n")
+            cat("\n--- Default envfit Print Summary (Coords on Axes 1 & 2) ---\n")
+            print(envfit_result_5d)
+            cat("--- End Default Summary ---\n")
+
+            # Detailed output section (No change needed here, it adapts based on envfit_result_5d structure)
+            # ... (code to print detailed vector_full_info and factor_coords/summary) ...
+            # Add the detailed printout code from the previous response here if desired
+
+        } else {
+            cat("envfit calculation failed.\n")
+        }
+    } else {
+         cat("\nSkipping envfit analysis: Fewer than 2 PCoA axes available from ade4 results.\n")
+    }
+} else {
+    cat("\nSkipping envfit analysis: PCoA axes object 'pcoa_axes_ade4' not available.\n")
+}
+```
+
+
+```{r}
+# ========= Publication heatmaps with requested styles =========
+# - Cell numbers fontsize = 16
+# - Colormaps: RdYlBu (reversed) for correlations [-1,1]; viridis for R² [0,1]
+# - R² text color: values < 0.2 or ≥ 0.6 → white; else black
+# - Predictor labels renamed
+# - Longer legends to reduce label crowding
+
+# ---- Dependencies ----
+if (!requireNamespace("ComplexHeatmap", quietly = TRUE)) {
+  if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+  BiocManager::install("ComplexHeatmap", ask = FALSE, update = FALSE)
+}
+if (!requireNamespace("circlize", quietly = TRUE)) install.packages("circlize")
+if (!requireNamespace("viridis", quietly = TRUE)) install.packages("viridis")
+if (!requireNamespace("RColorBrewer", quietly = TRUE)) install.packages("RColorBrewer")
+
+library(ComplexHeatmap)
+library(circlize)
+library(viridis)
+library(RColorBrewer)
+library(grid)
+
+# ---- Rename predictors for figure labels ----
+name_map <- c(
+  "social_bond"        = "Social bond",
+  "communal"           = "Communality",
+  "sexual_selection"   = "Mating system",
+  "mass"               = "Mass",
+  "Beak.Length_Culmen" = "Beak length",
+  "Beak.Width"         = "Beak width",
+  "Beak.Depth"         = "Beak depth"
+)
+
+rename_rows <- function(mat, map) {
+  if (!is.null(rownames(mat))) {
+    for (nm in names(map)) {
+      hits <- which(rownames(mat) == nm)
+      if (length(hits)) rownames(mat)[hits] <- map[[nm]]
+    }
+  }
+  mat
+}
+
+# ---- Color functions (fixed ranges) ----
+# Correlations [-1,1]: RdYlBu reversed ⇒ negative = blue, zero = yellow, positive = red
+col_fun_cor <- circlize::colorRamp2(
+  seq(-1, 1, length.out = 21),
+  rev(RColorBrewer::brewer.pal(11, "RdYlBu"))[c(
+    rep(1,1), rep(2,2), rep(3,2), rep(4,2), rep(5,2),
+    rep(6,3), rep(7,2), rep(8,2), rep(9,2), rep(10,2), rep(11,1)
+  )]
+)
+
+# R² [0,1]: viridis
+col_fun_r2 <- circlize::colorRamp2(
+  seq(0, 1, length.out = 21),
+  viridis::viridis(21)
+)
+
+# ---- Font sizes ----
+num_font   <- 16  # numbers inside cells
+axis_font  <- 18  # row/col labels
+legend_lab <- 16  # legend tick labels
+legend_tit <- 16  # legend title
+
+# ---- Text color helpers ----
+text_col_for_cor <- function(v) ifelse(abs(v) >= 0.5, "white", "black")
+text_col_for_r2  <- function(v) {
+  if (is.na(v)) return("black")
+  if (v < 0.2 || v >= 0.6) "white" else "black"
+}
+
+# ============================================================
+# 1) Numeric Predictors ~ PCoA (Pearson r)  [-1,1]  RdYlBu (rev)
+# ============================================================
+if (exists("predictor_axis_cor")) {
+  mat_cor <- as.matrix(predictor_axis_cor)
+  mat_cor <- rename_rows(mat_cor, name_map)
+
+  # Optional: ensure labels appear in desired order (keep current order if not needed)
+  # mat_cor <- mat_cor[c("Mass","Beak length","Beak width","Beak depth"), , drop = FALSE]
+
+  png("numeric_predictor_heatmap.png", width = 8, height = 7, units = "in", res = 600)
+  ht_cor <- Heatmap(
+    mat_cor,
+    name = "Pearson r",
+    col = col_fun_cor,
+    cluster_rows = FALSE,
+    cluster_columns = FALSE,
+    rect_gp = gpar(col = "grey90", lwd = 0.4),
+    border = TRUE,
+    na_col = "#f2f2f2",
+    column_names_rot = 45,
+    row_names_gp = gpar(fontsize = axis_font),
+    column_names_gp = gpar(fontsize = axis_font),
+    heatmap_legend_param = list(
+      at = seq(-1, 1, by = 0.5),
+      legend_height = unit(10, "cm"),   # longer legend to reduce label crowding
+      title_gp  = gpar(fontsize = legend_tit, fontface = "bold"),
+      labels_gp = gpar(fontsize = legend_lab),
+      grid_width  = unit(5, "mm"),
+      grid_height = unit(5, "mm")
+    ),
+    # ComplexHeatmap passes (j, i, x, y, width, height, fill)
+    cell_fun = function(j, i, x, y, width, height, fill) {
+      v <- mat_cor[i, j]
+      grid.text(sprintf("%.2f", v), x, y,
+                gp = gpar(col = text_col_for_cor(v), fontsize = num_font, fontface = "bold"))
+    }
+  )
+  draw(ht_cor, heatmap_legend_side = "right")
+  dev.off()
+  cat("Numeric predictor heatmap saved to numeric_predictor_heatmap.png\n")
+} else {
+  message("predictor_axis_cor not found.")
+}
+
+# ============================================================
+# 2) Categorical Predictors ~ PCoA (ANOVA R²)  [0,1]  viridis
+# ============================================================
+if (exists("anova_r2_matrix")) {
+  mat_r2 <- as.matrix(anova_r2_matrix)
+  mat_r2 <- rename_rows(mat_r2, name_map)
+
+  png("categorical_predictor_heatmap.png", width = 8, height = 7, units = "in", res = 600)
+  ht_r2 <- Heatmap(
+    mat_r2,
+    name = "ANOVA R²",
+    col = col_fun_r2,
+    cluster_rows = FALSE,
+    cluster_columns = FALSE,
+    rect_gp = gpar(col = "grey90", lwd = 0.4),
+    border = TRUE,
+    na_col = "#f2f2f2",
+    column_names_rot = 45,
+    row_names_gp = gpar(fontsize = axis_font),
+    column_names_gp = gpar(fontsize = axis_font),
+    heatmap_legend_param = list(
+      at = seq(0, 1, by = 0.2),
+      legend_height = unit(10, "cm"),   # longer legend
+      title_gp  = gpar(fontsize = legend_tit, fontface = "bold"),
+      labels_gp = gpar(fontsize = legend_lab),
+      grid_width  = unit(5, "mm"),
+      grid_height = unit(5, "mm")
+    ),
+    cell_fun = function(j, i, x, y, width, height, fill) {
+      v <- mat_r2[i, j]
+      if (!is.na(v)) {
+        grid.text(sprintf("%.2f", v), x, y,
+                  gp = gpar(col = text_col_for_r2(v), fontsize = num_font, fontface = "bold"))
+      }
+    }
+  )
+  draw(ht_r2, heatmap_legend_side = "right")
+  dev.off()
+  cat("Categorical predictor heatmap saved to categorical_predictor_heatmap.png\n")
+} else {
+  message("anova_r2_matrix not found.")
+}
+
+```
+
+
+```{r}
+# Chunk 7c: Manually Calculate and Visualize Factor Level Centroids on PCoA Axes 1-3
+
+library(dplyr)
+library(tidyr)
+library(pheatmap)
+library(RColorBrewer)
+
+# --- Check prerequisites ---
+# Need PCoA scores (up to axis 4 or 5) and the aligned original predictors
+if (!is.null(pcoa_axes_ade4) && exists("original_predictors_for_envfit")) {
+
+    cat("\n--- Manually Calculating & Visualizing Factor Level Centroids on PCoA Axes 1-4 ---\n") # Updated message
+    cat("   (Shows average position of each factor level on each axis)\n")
+    cat("   (White text indicates |centroid| > 0.1)\n")
+
+    # --- Determine axes to use (ensure consistency) ---
+    num_available_axes <- ncol(pcoa_axes_ade4) - 1 # Exclude 'species' column
+    axes_to_calc <- min(3, num_available_axes) # Calculate for first 4 (or fewer if not available)
+
+    if (axes_to_calc < 3) {
+         cat(paste("Warning: Only", axes_to_calc, "PCoA axes available. Calculating centroids for those.\n"))
+    } else {
+         cat("Calculating centroids for the first 4 PCoA axes.\n")
+    }
+
+    # --- Prepare Data ---
+    # select relevant PCoA scores (Axes 1 to axes_to_calc)
+    pcoa_scores_subset <- pcoa_axes_ade4 %>%
+        dplyr::select(all_of(c("species", paste0("PCoA", 1:axes_to_calc))))
+
+    # select categorical predictors from the aligned data
+    categorical_predictors_original <- original_predictors_for_envfit %>%
+        dplyr::select(where(is.factor)) %>%
+        rownames_to_column(var = "species") # Ensure species column for joining
+
+    # Combine scores and factors
+    combined_data_for_centroids <- pcoa_scores_subset %>%
+        left_join(categorical_predictors_original, by = "species")
+
+    # --- Calculate Centroids Manually ---
+    manual_centroids_list <- list()
+    categorical_col_names <- names(categorical_predictors_original %>% dplyr::select(-species))
+    pcoa_col_names <- names(pcoa_scores_subset %>% dplyr::select(-species))
+
+    for (factor_col in categorical_col_names) {
+        # Calculate mean score for each PCoA axis, grouped by the current factor
+        centroids_for_factor <- combined_data_for_centroids %>%
+            group_by(!!sym(factor_col)) %>%
+            summarise(across(all_of(pcoa_col_names), ~ mean(.x, na.rm = TRUE)), .groups = 'drop') %>%
+            # Create a meaningful label for the factor level (e.g., "learners_0", "learners_1")
+            mutate(FactorLevel = paste(factor_col, !!sym(factor_col), sep = "_")) %>%
+            dplyr::select(FactorLevel, all_of(pcoa_col_names)) # Keep only label and PCoA means
+
+        manual_centroids_list[[factor_col]] <- centroids_for_factor
+    }
+
+    # Combine centroids from all factors into one dataframe
+    manual_centroids_df <- bind_rows(manual_centroids_list)
+
+    # Convert to matrix for pheatmap, using FactorLevel as rownames
+    manual_centroids_matrix <- manual_centroids_df %>%
+        column_to_rownames(var = "FactorLevel") %>%
+        as.matrix()
+
+    # Check if calculation was successful
+    if (nrow(manual_centroids_matrix) > 0 && ncol(manual_centroids_matrix) > 0) {
+
+        cat("Manually calculated centroids for", nrow(manual_centroids_matrix), "factor levels across", ncol(manual_centroids_matrix), "axes.\n")
+
+        # --- Prepare Colors and Text ---
+        centroid_colors <- colorRampPalette(rev(brewer.pal(n = 11, name = "RdBu")))(100)
+        max_abs_centroid <- max(abs(manual_centroids_matrix), na.rm = TRUE)
+        scale_limit <- max_abs_centroid * 1.01
+        centroid_breaks <- seq(-scale_limit, scale_limit, length.out = 101)
+
+        fixed_threshold <- 0.1
+        abs_centroids <- abs(manual_centroids_matrix)
+        text_colors <- matrix("black", nrow=nrow(manual_centroids_matrix), ncol=ncol(manual_centroids_matrix))
+        text_colors[abs_centroids > fixed_threshold] <- "white"
+
+        # --- Create the Heatmap ---
+        pheatmap(
+            manual_centroids_matrix, # Use the manually calculated centroids
+            cluster_rows = FALSE,
+            cluster_cols = FALSE,
+            color = centroid_colors,
+            breaks = centroid_breaks,
+            display_numbers = matrix(sprintf("%.2f", manual_centroids_matrix),
+                                     nrow=nrow(manual_centroids_matrix)),
+            number_color = text_colors,
+            fontsize_number = 8,
+            fontsize_row = 8,
+            fontsize_col = 10,
+            main = paste("Factor Level Centroids on PCoA Axes 1 to", axes_to_calc, # Use axes_to_calc
+                         "\n(Manually Calculated Avg. Position, White Text if |Val| > 0.1)"), # Updated title
+            legend = TRUE,
+            na_col = "grey"
+        )
+
+    } else {
+        cat("Manual centroid calculation failed or resulted in empty matrix.\n")
+    }
+
+} else {
+    cat("\nSkipping centroid visualization: PCoA axes or aligned original predictors not available.\n")
+}
+```
+
+
+
+```{r}
+# Chunk 8b: Correlation Heatmap between GMM Responses and PCoA Axes (1-4)
+
+# Check if we have enough axes and response data
+if (!is.null(pcoa_axes_ade4) && ncol(pcoa_axes_ade4) >= 5 && !is.null(gmm_responses_complete)) {
+    cat("\nCalculating correlations between GMM responses and PCoA axes (1-4)...\n")
+
+    # Get PCoA axes and merge with GMM responses
+    pcoa_axes_subset <- pcoa_axes_ade4 %>%
+        dplyr::select(all_of(intersect(c("species", "PCoA1", "PCoA2", "PCoA3"), names(.))))
+    
+    pcoa_gmm_merged <- pcoa_axes_subset %>%
+        inner_join(gmm_responses_complete %>% rownames_to_column(var="species"), by = "species")
+    
+    if (nrow(pcoa_gmm_merged) > 2) {
+        # Get GMM response columns
+        gmm_cols_present <- intersect(gmm_response_cols, names(pcoa_gmm_merged))
+        
+        if(length(gmm_cols_present) > 0) {
+            # Calculate correlation matrix
+            cor_pcoa_gmm <- cor(pcoa_gmm_merged[, c("PCoA1", "PCoA2", "PCoA3")], 
+                               pcoa_gmm_merged[, gmm_cols_present], 
+                               use = "pairwise.complete.obs")
+            
+            # Create clean labels with vocalization types
+            vocalization_names <- c(
+                "Flat Whistles", 
+                "Slow Trills", 
+                "Fast Trills", 
+                "Noisy Songs", 
+                "Ultrafast Trills", 
+                "Slow Modulated Whistles", 
+                "Fast Modulated Whistles", 
+                "Harmonic Stacks"
+            )
+            
+            # Map GMM indices to vocalization names
+            gmm_indices <- as.numeric(gsub("gmm_prob_([0-9])_mean", "\\1", gmm_cols_present))
+            clean_gmm_labels <- vocalization_names[gmm_indices + 1] # +1 because R is 1-indexed
+            
+            # Set up color palette
+            my_colors <- colorRampPalette(c("navy", "white", "darkred"))(100)
+            
+            # Create text color matrix based on correlation value percentiles
+            cor_values <- t(cor_pcoa_gmm)
+            # Calculate threshold based on quantiles of absolute values
+            abs_cor_values <- abs(cor_values)
+            fixed_threshold <- 0.1
+
+            # Set text colors based on threshold
+            text_colors <- matrix("black", nrow=nrow(cor_values), ncol=ncol(cor_values))
+            condition_matrix <- abs_cor_values > fixed_threshold
+            text_colors[condition_matrix] <- "white"
+
+            # --- START DEBUG ---
+            cat("\n--- DEBUG INFO FOR CHUNK 8b ---\n")
+            cat("Fixed Threshold:", fixed_threshold, "\n")
+            cat("Dimensions of cor_values:", dim(cor_values), "\n")
+            cat("Sample of cor_values (raw):\n")
+            print(head(cor_values)) # Print the actual numbers
+            cat("\nSample of abs_cor_values:\n")
+            print(head(abs(cor_values))) # Print the absolute values
+            cat("\nSample of condition_matrix (abs > threshold):\n")
+            print(head(condition_matrix)) # Print TRUE/FALSE matrix
+            cat("\nSample of final text_colors matrix:\n")
+            print(head(text_colors)) # Print the resulting color matrix
+            cat("--- END DEBUG INFO ---\n\n")
+            # --- END DEBUG ---
+
+            # Create the heatmap with custom text colors
+            pheatmap(
+                # Use cor_values directly now since it's already defined
+                cor_values,
+                cluster_rows = FALSE,
+                cluster_cols = FALSE,
+                color = my_colors,
+                display_numbers = matrix(
+                    # Format the numbers based on the same cor_values
+                    sprintf("%.2f", cor_values),
+                    nrow = nrow(cor_values), # Use nrow/ncol of the actual matrix
+                    ncol = ncol(cor_values)
+                ),
+                number_color = text_colors, # Use the verified text_colors
+                fontsize_number = 9,
+                fontsize_row = 8,
+                fontsize_col = 10,
+                main = "Correlation between GMM Responses and PCoA Axes",
+                labels_row = clean_gmm_labels
+            )
+        } else {
+            cat("No GMM response columns found after merging.\n")
+        }
+    } else {
+        cat("Insufficient common data between PCoA axes and GMM responses.\n")
+    }
+} else {
+    cat("\nSkipping correlation: PCoA results or GMM responses unavailable.\n")
+}
+```
+```{r}
+# --- NEW CHUNK: Load and Process Synonym Data ---
+cat("\n--- Loading and Processing Synonym Data ---\n")
+
+# Define synonym file path
+synonym_file <- "./matching_final_corrected.csv"
+
+if (file.exists(synonym_file)) {
+    cat("Loading synonym data from:", synonym_file, "\n")
+    
+    # Load synonym data (same as phylogenetic signal script)
+    synonym_data_raw <- readr::read_csv(synonym_file, 
+                                        col_types = readr::cols(.default = "c"), 
+                                        show_col_types = FALSE)
+    
+    # Process synonym data: replace spaces with underscores
+    synonym_data <- synonym_data_raw %>% 
+        mutate(across(everything(), ~stringr::str_replace_all(., " ", "_")))
+    
+    # Process synonym rows for matching (exact same logic as phylogenetic signal script)
+    synonym_rows_list <- apply(synonym_data, 1, function(row) {
+        unique(as.character(row[!is.na(row) & row != "" & row != "_"]))
+    })
+    
+    # Remove empty synonym sets
+    synonym_rows_list <- synonym_rows_list[sapply(synonym_rows_list, length) > 0]
+    
+    cat("Synonym data loaded successfully!\n")
+    cat(sprintf("- Total rows in file: %d\n", nrow(synonym_data)))
+    cat(sprintf("- Non-empty synonym sets: %d\n", length(synonym_rows_list)))
+    
+    # Show first few examples
+    cat("First 3 synonym sets (examples):\n")
+    for(i in 1:min(3, length(synonym_rows_list))) {
+        cat(sprintf("  Set %d: %s\n", i, paste(synonym_rows_list[[i]], collapse = ", ")))
+    }
+    
+    # Count total unique species in synonym data
+    all_synonym_species <- unique(unlist(synonym_rows_list))
+    all_synonym_species <- all_synonym_species[all_synonym_species != "" & 
+                                               !is.na(all_synonym_species) & 
+                                               all_synonym_species != "_"]
+    cat(sprintf("- Total unique species in synonym data: %d\n", length(all_synonym_species)))
+    
+} else {
+    warning("Synonym file not found at: ", synonym_file)
+    warning("Creating empty synonym_rows_list - only direct matching will be used")
+    synonym_rows_list <- list()
+}
+
+cat("--- Synonym data processing complete ---\n\n")
+```
+
+
+```{r}
+# Chunk 8c: Create Spatial Dataset with Mean PCoA Axes - OPTIMIZED VERSION
+cat("\n--- Chunk 8c: Creating Spatial Trait Dataset (OPTIMIZED) ---\n")
+
+library(dplyr)
+library(purrr)
+library(tidyr)
+library(readr)
+library(stringr)
+
+# Setup paths (same as before)
+output_dir_spatial <- file.path(output_dir, "spatial_traits")
+if (!dir.exists(output_dir_spatial)) {
+  dir.create(output_dir_spatial, recursive = TRUE)
+}
+
+presence_sites_file <- "./data/grid_1.0deg_species_lists.csv"
+valid_sites_file <- "./output/richness_map/richness_1deg.csv"
+
+# Load data (same as before)
+cat("Loading data files...\n")
+valid_sites_df <- readr::read_csv(valid_sites_file, show_col_types = FALSE) %>% dplyr::select(grid_id)
+valid_grid_ids <- unique(valid_sites_df$grid_id)
+presence_data_raw <- readr::read_csv(presence_sites_file, show_col_types = FALSE)
+presence_data_filtered <- presence_data_raw %>% filter(grid_id %in% valid_grid_ids)
+
+cat(sprintf("Loaded %d valid grid cells, %d presence records\n", 
+            length(valid_grid_ids), nrow(presence_data_filtered)))
+
+species_with_pcoa_data <- pcoa_axes_ade4$species
+pcoa_colnames <- names(pcoa_axes_ade4)[grepl("^PCoA", names(pcoa_axes_ade4))]
+
+# --- OPTIMIZATION 1: Pre-compute ALL species matches ONCE ---
+cat("Step 1: Pre-computing species matching lookup table...\n")
+
+# Parse all unique species from all grid cells
+parse_species_list <- function(list_string) {
+    if (is.na(list_string) || list_string %in% c("[]", "['']")) return(character(0))
+    cleaned_string <- gsub('^\\["|\"\\]$|^"|\\[|\\]', '', list_string)
+    species <- stringr::str_split(cleaned_string, pattern = "\\s*,\\s*")[[1]]
+    species <- trimws(species[species != "" & !species %in% c("''", "'")])
+    species <- gsub("'", "", species)
+    species <- stringr::str_replace_all(species, " ", "_")
+    return(unique(species))
+}
+
+# Get ALL unique species across all grid cells
+cat("  Parsing all species lists...\n")
+all_species_lists <- purrr::map(presence_data_filtered$sci_name_list, parse_species_list)
+all_unique_species <- unique(unlist(all_species_lists))
+cat(sprintf("  Found %d unique species across all grid cells\n", length(all_unique_species)))
+
+# Create species lookup table ONCE
+cat("  Creating species -> PCoA species lookup table...\n")
+species_lookup <- setNames(rep(NA_character_, length(all_unique_species)), all_unique_species)
+
+# Direct matches first
+direct_matches <- intersect(all_unique_species, species_with_pcoa_data)
+species_lookup[direct_matches] <- direct_matches
+cat(sprintf("  Direct matches: %d\n", length(direct_matches)))
+
+# Synonym matches for remaining species
+species_needing_synonyms <- all_unique_species[is.na(species_lookup)]
+synonym_matches_found <- 0
+
+if (length(species_needing_synonyms) > 0 && exists("synonym_rows_list") && length(synonym_rows_list) > 0) {
+    cat(sprintf("  Processing synonyms for %d species...\n", length(species_needing_synonyms)))
+    
+    # Track available PCoA species to avoid double assignment
+    available_pcoa <- setdiff(species_with_pcoa_data, direct_matches)
+    available_pcoa_set <- setNames(rep(TRUE, length(available_pcoa)), available_pcoa)
+    
+    # Progress bar for synonym matching
+    pb <- txtProgressBar(min = 0, max = length(species_needing_synonyms), style = 3)
+    
+    for (i in seq_along(species_needing_synonyms)) {
+        sp <- species_needing_synonyms[i]
+        
+        # Find synonym rows containing this species
+        relevant_rows <- which(sapply(synonym_rows_list, function(syn_row) sp %in% syn_row))
+        
+        if (length(relevant_rows) > 0) {
+            potential_synonyms <- unique(unlist(synonym_rows_list[relevant_rows]))
+            potential_synonyms <- potential_synonyms[potential_synonyms != "" & 
+                                                   !is.na(potential_synonyms) & 
+                                                   potential_synonyms != "_"]
+            
+            # Find first available match
+            for (syn in potential_synonyms) {
+                if (syn %in% names(available_pcoa_set) && available_pcoa_set[[syn]]) {
+                    species_lookup[sp] <- syn
+                    available_pcoa_set[[syn]] <- FALSE
+                    synonym_matches_found <- synonym_matches_found + 1
+                    break
+                }
+            }
+        }
+        
+        if (i %% 100 == 0) setTxtProgressBar(pb, i)
+    }
+    close(pb)
+}
+
+cat(sprintf("  Synonym matches: %d\n", synonym_matches_found))
+cat(sprintf("  Total matches: %d/%d (%.1f%%)\n", 
+            sum(!is.na(species_lookup)), length(species_lookup),
+            100 * sum(!is.na(species_lookup)) / length(species_lookup)))
+
+# --- OPTIMIZATION 2: Vectorized grid cell processing ---
+cat("Step 2: Processing grid cells with vectorized operations...\n")
+
+# Use the pre-computed lookup for fast matching
+process_grid_cell_fast <- function(species_list, lookup_table) {
+    if (length(species_list) == 0) return(character(0))
+    matches <- lookup_table[species_list]
+    return(matches[!is.na(matches)])
+}
+
+# Process all grid cells using vectorized operations
+presence_data_processed <- presence_data_filtered %>%
+    mutate(
+        species_list_parsed = all_species_lists,  # Use pre-computed parsing
+        species_list_with_pcoa = purrr::map(species_list_parsed, ~ process_grid_cell_fast(.x, species_lookup)),
+        n_species_with_pcoa = purrr::map_int(species_list_with_pcoa, length)
+    ) %>%
+    filter(n_species_with_pcoa > 0) %>%
+    dplyr::select(grid_id, species_list_with_pcoa, n_species_with_pcoa)
+
+cat(sprintf("Step 3: Found %d valid grid cells with PCoA data\n", nrow(presence_data_processed)))
+
+if (nrow(presence_data_processed) == 0) {
+    stop("No grid cells remained after matching species with PCoA data.")
+}
+
+# --- Step 4: Calculate means (same as before but with progress) ---
+cat("Step 4: Calculating mean PCoA axes per grid cell...\n")
+
+presence_long <- presence_data_processed %>% 
+    dplyr::select(grid_id, species_list_with_pcoa) %>% 
+    tidyr::unnest(cols = c(species_list_with_pcoa)) %>% 
+    rename(species = species_list_with_pcoa)
+
+spatial_pcoa_data <- presence_long %>% left_join(pcoa_axes_ade4, by = "species")
+
+if(any(is.na(spatial_pcoa_data$PCoA1))) {
+    warning("NA values found in PCoA scores after joining.")
+    spatial_pcoa_data <- spatial_pcoa_data %>% filter(!is.na(PCoA1))
+}
+
+spatial_mean_traits <- spatial_pcoa_data %>%
+    group_by(grid_id) %>%
+    summarise(
+        across(all_of(pcoa_colnames), ~ mean(.x, na.rm = TRUE)), 
+        species_list_final = list(unique(species)), 
+        n_species_final = n_distinct(species),
+        .groups = "drop"
+    ) %>%
+    rename_with(~ paste0("mean_", .), .cols = all_of(pcoa_colnames))
+
+cat(sprintf("Calculated mean PCoA axes for %d grid cells\n", nrow(spatial_mean_traits)))
+
+# --- Steps 5-6: Coordinate extraction and saving (same as before) ---
+cat("Step 5: Extracting coordinates...\n")
+coord_pattern <- "^lon(n?)(\\d+)p.*_lat(n?)(\\d+)p.*$"
+extracted_coords_matrix <- stringr::str_match(spatial_mean_traits$grid_id, coord_pattern)
+
+spatial_mean_traits <- spatial_mean_traits %>%
+  mutate(
+    lon_sign = ifelse(!is.na(extracted_coords_matrix[, 2]) & extracted_coords_matrix[, 2] == "n", -1, 1),
+    lon_val = as.numeric(extracted_coords_matrix[, 3]), 
+    lon = lon_sign * lon_val,
+    lat_sign = ifelse(!is.na(extracted_coords_matrix[, 4]) & extracted_coords_matrix[, 4] == "n", -1, 1),
+    lat_val = as.numeric(extracted_coords_matrix[, 5]), 
+    lat = lat_sign * lat_val
+  ) %>%
+  filter(!is.na(lon) & !is.na(lat)) %>%
+  dplyr::select(-matches("(lon|lat)_(sign|val)"))
+
+cat("Step 6: Saving results...\n")
+output_csv_file <- file.path(output_dir_spatial, "grid_mean_pcoa_traits.csv")
+spatial_mean_traits_tosave <- spatial_mean_traits %>%
+     mutate(species_list_final_str = sapply(species_list_final, function(x) paste(sort(x), collapse=";"))) %>%
+     dplyr::select(-species_list_final)
+
+readr::write_csv(spatial_mean_traits_tosave, output_csv_file)
+cat(sprintf("Saved spatial trait data: %s\n", output_csv_file))
+cat("--- Optimized spatial dataset creation complete ---\n")
+```
+
+```{r}
+# --- 6. Generate Maps using sf ---
+cat("Generating maps for mean PCoA axes using sf...\n")
+
+# Check if there are rows left after coordinate extraction
+if(nrow(spatial_mean_traits) == 0) {
+    stop("No rows remaining in spatial_mean_traits after coordinate extraction. Cannot create spatial object.")
+}
+
+# --- 6a. Create sf polygons ---
+cat("Creating sf polygon object...\n")
+polygon_list <- lapply(1:nrow(spatial_mean_traits), function(i) {
+    lon_bl <- spatial_mean_traits$lon[i]; lat_bl <- spatial_mean_traits$lat[i]
+    corners <- matrix(c(lon_bl,   lat_bl, lon_bl+1, lat_bl, lon_bl+1, lat_bl+1, lon_bl,   lat_bl+1, lon_bl,   lat_bl), ncol = 2, byrow = TRUE)
+    st_polygon(list(corners))
+})
+sfc_polygons <- st_sfc(polygon_list, crs = 4326) # WGS84
+spatial_mean_traits_sf <- st_sf(spatial_mean_traits, geometry = sfc_polygons)
+cat("sf object created successfully.\n")
+
+# --- 6b. Get world map ---
+world_map <- ggplot2::map_data("world") # Use ggplot2's function
+
+# --- 6c. Loop and plot using geom_sf with PERCENTILE limits per map ---
+mean_pcoa_cols <- names(spatial_mean_traits)[grepl("^mean_PCoA", names(spatial_mean_traits))]
+map_plots_list <- list()
+
+# Define the quantiles for limits
+lower_quantile <- 0.10
+upper_quantile <- 0.90
+cat(sprintf("Using %.0fth/%.0fth percentiles for map color limits.\n", lower_quantile*100, upper_quantile*100))
+
+for (pcoa_col in mean_pcoa_cols) {
+    axis_num <- stringr::str_extract(pcoa_col, "\\d+")
+    plot_title <- paste("Mean PCoA Axis", axis_num, "per 1° Grid Cell")
+    plot_subtitle <- sprintf("Calculated from species present. Colors scaled by %.0fth/%.0fth percentile range.", lower_quantile*100, upper_quantile*100)
+
+    # Check if column exists and has data
+    if(!pcoa_col %in% names(spatial_mean_traits_sf)) {
+         cat("Skipping map for non-existent column in sf object:", pcoa_col, "\n")
+         next
+    }
+    current_values <- spatial_mean_traits_sf[[pcoa_col]]
+    current_values_clean <- current_values[!is.na(current_values)]
+
+    if(length(current_values_clean) == 0) {
+         cat("Skipping map for", pcoa_col, "- all values NA or no data.\n"); next
+    }
+
+    # --- Calculate PERCENTILE-BASED color limits for THIS map ---
+    # Calculate the specified percentiles
+    percentiles <- quantile(current_values_clean,
+                            probs = c(lower_quantile, upper_quantile),
+                            na.rm = TRUE, # Should not be needed, but safe
+                            type = 7) # Default quantile type
+
+    lower_perc <- percentiles[1]
+    upper_perc <- percentiles[2]
+
+    # Find the maximum absolute value of these percentiles
+    max_abs_perc_limit <- max(abs(lower_perc), abs(upper_perc), na.rm = TRUE)
+
+    # Handle cases where max_abs_perc_limit is zero or non-finite
+    # Use a small non-zero threshold check
+    if(is.na(max_abs_perc_limit) || !is.finite(max_abs_perc_limit) || max_abs_perc_limit < .Machine$double.eps^0.5) {
+        warning(paste("Percentile-based range for", pcoa_col, "is effectively zero or invalid. Using default limits (-0.1 to 0.1). Check data distribution."))
+        current_color_limit <- c(-0.1, 0.1) # Use a small default range
+    } else {
+        # Create symmetric limits around zero based on the max absolute percentile
+        current_color_limit <- c(-max_abs_perc_limit, max_abs_perc_limit)
+    }
+    cat(sprintf(" Percentile limits for %s set to: [%.3f, %.3f]\n", pcoa_col, current_color_limit[1], current_color_limit[2]))
+    # --- End PERCENTILE limit calculation ---
+
+    # Create the plot using geom_sf
+    map_plot <- ggplot() +
+        geom_polygon(data = world_map, aes(x = long, y = lat, group = group),
+                     fill = "grey80", color = "white", linewidth = 0.1) +
+        geom_sf(data = spatial_mean_traits_sf,
+                aes(fill = !!sym(pcoa_col)),
+                color = NA) +
+        # Use the PERCENTILE-BASED color limits calculated for *this* axis
+        scale_fill_gradient2(
+            name = paste("Mean PCoA", axis_num),
+            low = "blue", mid = "white", high = "red", midpoint = 0,
+            limits = current_color_limit, # *** USE PERCENTILE LIMITS ***
+            oob = scales::squish,         # *** ADDED: Squish values outside limits to the limit colors ***
+            na.value = "transparent"
+        ) +
+        coord_sf(crs = 4326, datum = NA) + # Use default lat/lon, remove graticules
+        labs(title = plot_title, subtitle = plot_subtitle, x = "Longitude", y = "Latitude") +
+        theme_minimal(base_size = 10) +
+        theme(
+            panel.grid = element_blank(),
+            axis.text = element_text(size=8),
+            legend.position = "bottom",
+            legend.key.width = unit(1.5, "cm")
+        )
+
+    map_plots_list[[pcoa_col]] <- map_plot
+    print(map_plot) # Display the plot
+
+    # Save the plot
+    output_map_file <- file.path(output_dir_spatial, paste0("map_", pcoa_col, "_sf_perc_limits.png")) # Changed suffix
+    ggsave(output_map_file, map_plot, width = 8, height = 5, dpi = 300)
+    cat(paste("Saved sf map with percentile limits:", output_map_file, "\n"))
+}
+
+cat("\n--- Spatial Trait Calculation and Mapping Complete ---\n")
+```
+
+```{r}
+# --- NEW: Chunk 9a: Create Base Dataframe with Predictors, Learners, and Responses ---
+cat("\n--- Chunk 9a: Creating Base Dataframe for Modeling ---\n")
+
+# Required objects:
+# - pcoa_axes_ade4: PCoA scores (species, PCoA1, PCoA2, ...)
+# - full_data: Original data with n_sequences, n_recordings
+# - gmm_responses_complete: GMM probabilities (rownames=species) matching PCoA species
+# - data_processed_complete: Processed data including 'learners' (rownames=species) matching PCoA species
+
+if (!exists("pcoa_axes_ade4") || !exists("full_data") || !exists("gmm_responses_complete") || !exists("data_processed_complete")) {
+    stop("Missing required data objects from previous chunks (PCoA axes, full_data, GMM responses, or data_processed_complete).")
+}
+if (!"learners" %in% names(data_processed_complete)) {
+    stop("'learners' column is missing from 'data_processed_complete'. Check Chunk 3 modifications.")
+}
+
+# 1. Get Scaled Additional Predictors (n_sequences, n_recordings)
+additional_fixed_effects <- c("n_sequences", "n_recordings")
+scaled_additional_fixed_data <- full_data %>%
+    mutate(species = str_replace_all(species, " ", "_")) %>%
+    dplyr::select(species, all_of(additional_fixed_effects)) %>%
+    mutate(across(all_of(additional_fixed_effects), as.numeric)) %>%
+    # Scale within the species present in the PCoA analysis
+    filter(species %in% pcoa_axes_ade4$species) %>%
+    mutate(across(all_of(additional_fixed_effects), ~ scale(.)[,1], .names = "{.col}_scaled")) %>%
+    dplyr::select(species, ends_with("_scaled")) %>%
+    na.omit() # Remove rows if scaling resulted in NAs
+
+scaled_additional_fixed_names <- names(scaled_additional_fixed_data %>% dplyr::select(-species))
+cat("Scaled additional predictors prepared:", paste(scaled_additional_fixed_names, collapse=", "), "\n")
+
+# 2. Get Learner Status
+learner_status_data <- data_processed_complete %>%
+    rownames_to_column(var = "species") %>%
+    dplyr::select(species, learners) # Ensure learners column is selected
+
+# 3. Get PCoA Axes
+predictors_pcoa <- pcoa_axes_ade4 # Already has 'species' column
+
+# 4. Get GMM Responses (use the one already aligned with PCoA)
+response_data <- gmm_responses_complete %>% rownames_to_column(var = "species")
+response_vars <- names(response_data %>% dplyr::select(-species)) # Get GMM column names
+
+# 5. Merge All Components
+base_model_data <- predictors_pcoa %>%
+    inner_join(scaled_additional_fixed_data, by = "species") %>%
+    inner_join(learner_status_data, by = "species") %>%
+    inner_join(response_data, by = "species")
+
+cat("Base data frame created with", nrow(base_model_data), "species.\n")
+cat("Columns:", paste(names(base_model_data), collapse=", "), "\n")
+if (nrow(base_model_data) == 0) {stop("Base data frame is empty after joins. Check species name consistency.")}
+```
+
+```{r}
+# --- NEW: Chunk 9b: Define Data Preparation Function (ATTEMPTING FIX FOR GMM NAs using Direct Assignment) ---
+cat("\n--- Chunk 9b: Defining Phylogenetic Data Preparation Function (ATTEMPTING FIX FOR GMM NAs using Direct Assignment) ---\n")
+
+# Required packages (ensure they are loaded before calling this chunk)
+library(brms)
+library(ape)
+library(dplyr)
+library(readr)
+library(stringr)
+library(tibble)
+
+prepare_brms_data <- function(subset_data, full_phylo_tree, response_cols, synonym_list, id_col = "species") {
+    
+    # --- Initial Subset Information ---
+    cat("\n--- Preparing data for subset: ---\n")
+    if("learners" %in% names(subset_data)) { 
+        cat("Learner distribution:\n")
+        print(table(subset_data$learners)) 
+    } else {
+        cat(" (Overall data)\n")
+    }
+    cat("Initial species count:", nrow(subset_data), "\n")
+    
+    # --- Check Minimum Species Count ---
+    if (nrow(subset_data) < 10) { 
+      warning("Subset has fewer than 10 species. Phylogenetic model might be unstable or fail.")
+      if (nrow(subset_data) < 3) {
+          cat("ERROR: Subset has fewer than 3 species. Cannot fit phylogenetic model.\n")
+          return(NULL) # Return NULL to indicate failure
+      }
+    }
+
+    # --- 1. Prepare Response Variable Matrix ---
+    cat("Processing response variables...\n")
+    
+    # Ensure id_col exists before using it
+    if (!id_col %in% names(subset_data)) stop("Specified id_col '", id_col, "' not found in subset_data.")
+        
+    # --- Step 1a: Filter rows with NAs in ANY response column ---
+    rows_before_na_rm <- nrow(subset_data)
+    subset_data <- subset_data %>% 
+        filter(complete.cases(dplyr::select(., all_of(response_cols))))
+    rows_after_na_rm <- nrow(subset_data)
+    if(rows_after_na_rm < rows_before_na_rm) {
+        cat(" Removing", rows_before_na_rm - rows_after_na_rm, "rows with NA in initial response variables.\n")
+    }
+    if(nrow(subset_data) == 0) { cat("ERROR: No species left after removing NA responses.\n"); return(NULL) }
+
+    # --- Step 1b: Extract the response matrix from the clean data ---
+    response_matrix_for_processing <- subset_data %>% 
+        dplyr::select(all_of(response_cols)) %>% 
+        as.matrix()
+    
+    # Store original row names/IDs from the *filtered* subset_data for alignment
+    original_ids_filtered <- subset_data[[id_col]] 
+    
+    # --- Step 1c: Apply numeric processing (small values, normalization, zero transform) ---
+    threshold <- 1e-10
+    response_matrix_for_processing[response_matrix_for_processing < threshold] <- 0
+    
+    row_sums <- rowSums(response_matrix_for_processing)
+    zero_sum_indices <- which(row_sums == 0)
+    
+    # We need to filter BOTH the matrix AND the main data frame if zero-sum rows are found
+    if(length(zero_sum_indices) > 0) {
+        cat("Removing", length(zero_sum_indices), "rows with zero sum in responses.\n")
+        response_matrix_for_processing <- response_matrix_for_processing[-zero_sum_indices, , drop = FALSE]
+        subset_data <- subset_data[-zero_sum_indices, ] # Filter the main data frame
+        row_sums <- row_sums[-zero_sum_indices] # Update row_sums
+        original_ids_filtered <- original_ids_filtered[-zero_sum_indices] # Update the stored IDs
+        if(nrow(subset_data) == 0) { cat("ERROR: No species left after removing zero-sum responses.\n"); return(NULL) }
+    }
+    
+    # Ensure row_sums are not zero before division
+    row_sums[row_sums == 0] <- 1e-9 
+    response_matrix_normalized <- response_matrix_for_processing / row_sums 
+
+    # Handle zeros with Smithson-Verkuilen transformation
+    N_cats <- ncol(response_matrix_normalized)
+    response_matrix_final <- response_matrix_normalized # Start with normalized
+    if (any(response_matrix_normalized == 0)) {
+        cat(" Applying Smithson-Verkuilen transformation for zeros.\n")
+        response_matrix_transformed <- (response_matrix_normalized * (N_cats - 1) + 0.5) / N_cats
+        row_sums_transformed <- rowSums(response_matrix_transformed)
+        row_sums_transformed[row_sums_transformed == 0] <- 1e-9 # Ensure no division by zero
+        response_matrix_final <- response_matrix_transformed / row_sums_transformed
+    }
+    
+    # --- Step 1d: Direct Assignment back to the data frame ---
+    # Ensure row counts match EXACTLY after all filtering
+    if(nrow(response_matrix_final) != nrow(subset_data)) {
+         stop("FATAL INTERNAL ERROR: Row count mismatch between processed responses (", nrow(response_matrix_final), 
+              ") and filtered subset_data (", nrow(subset_data), ") before final assignment.")
+    }
+    # Assign the processed columns directly back, replacing original ones
+    subset_data[, response_cols] <- response_matrix_final
+    cat("Processed response variables assigned back to data frame.\n")
+    
+    # Final check within this section
+    if(any(is.na(subset_data[,response_cols]))) {
+       stop("FATAL ERROR: NAs introduced into response columns during processing or assignment! Check calculations.")
+    } else {
+       cat("Response variable processing complete. No NAs found in final response columns.\n")
+    }
+    # --- End Response Processing ---
+
+    # --- 2. Match Data with Phylogeny Using Direct Matching and Synonyms ---
+    # (This section remains the same as the previous 'REVISED & COMPLETE' version)
+    # It operates on the `subset_data` which now contains the correctly processed responses
+    cat("Matching data with phylogeny...\n")
+    
+    # --- Fix for list column: Ensure input species IDs are character vector ---
+    species_in_subset_raw <- subset_data[[id_col]] 
+    if (is.list(species_in_subset_raw)) {
+        cat(" Input species column ('", id_col, "') is a list. Unlisting...\n")
+        species_in_subset <- unlist(species_in_subset_raw)
+        if(length(species_in_subset) != nrow(subset_data)) {
+            stop("FATAL: Failed to correctly unlist the input species column '", id_col, "'.")
+        }
+         # Add the unlisted version back to the dataframe temporarily for filtering
+         subset_data$temp_match_id <- species_in_subset 
+    } else {
+        species_in_subset <- as.character(species_in_subset_raw)
+        subset_data$temp_match_id <- species_in_subset # Use original if already character
+    }
+    # --- End list column fix ---
+    
+    tree_labels <- full_phylo_tree$tip.label
+
+    # Perform direct matching first using the guaranteed character vector
+    initial_matches <- intersect(species_in_subset, tree_labels)
+    cat(paste(" Found", length(initial_matches), "direct matches between subset species and tree labels.\n"))
+
+    # Identify species needing synonym search
+    species_missing <- setdiff(species_in_subset, initial_matches)
+    tree_available <- setdiff(tree_labels, initial_matches)
+    cat(paste(" ", length(species_missing), "subset species require synonym search against", length(tree_available), "available tree labels.\n"))
+    
+    # Perform synonym matching
+    synonym_matches <- list()
+    found_syn_count <- 0
+    if(length(species_missing) > 0 && length(tree_available) > 0 && length(synonym_list) > 0) {
+        cat(" Attempting synonym matching...")
+        available_tree_label_set <- setNames(rep(TRUE, length(tree_available)), nm = tree_available) 
+        pb <- txtProgressBar(min = 0, max = length(species_missing), style = 3, width = 50) 
+        for(i in seq_along(species_missing)) {
+            missing_sp <- species_missing[i]
+            relevant_row_indices <- which(sapply(synonym_list, function(syn_row) missing_sp %in% syn_row))
+            if(length(relevant_row_indices) > 0) {
+                 potential_synonyms <- unique(unlist(synonym_list[relevant_row_indices]))
+                 potential_synonyms <- potential_synonyms[potential_synonyms != "" & !is.na(potential_synonyms) & potential_synonyms != "_"] 
+                 for(syn in potential_synonyms) {
+                     if(syn %in% names(available_tree_label_set) && isTRUE(available_tree_label_set[[syn]])) { 
+                          synonym_matches[[missing_sp]] <- syn 
+                          available_tree_label_set[[syn]] <- FALSE 
+                          found_syn_count <- found_syn_count + 1
+                          break 
+                     }
+                 }
+            }
+            setTxtProgressBar(pb, i) 
+        }
+        close(pb) 
+        cat(" Found", found_syn_count, "synonym matches.\n")
+    } else {
+         cat(" Skipping synonym matching step (no missing species, no available labels, or no synonym list).\n")
+    }
+    
+    # Combine direct and synonym matches into a map
+    species_map <- c(
+        setNames(as.character(initial_matches), as.character(initial_matches)), 
+        lapply(synonym_matches, as.character)                                   
+    )                 
+    matched_subset_species <- names(species_map) 
+    tree_labels_to_keep <- unique(unname(unlist(species_map))) 
+
+    # Filter the data frame based on matched species
+    subset_data_matched <- subset_data %>% 
+        filter(temp_match_id %in% matched_subset_species)
+        
+    cat(" Species retained after matching:", nrow(subset_data_matched), "\n")
+    
+    if(nrow(subset_data_matched) < 3) { 
+         cat("ERROR: Fewer than 3 species remaining after matching with tree.\n"); return(NULL)
+    }
+    
+    # Create tree_label column
+    subset_data_matched$tree_label <- sapply(subset_data_matched$temp_match_id, function(id) {
+        match <- species_map[[id]]
+        if (is.null(match)) { NA_character_ } else { as.character(match) }
+    }, USE.NAMES = FALSE)
+    
+    if(any(is.na(subset_data_matched$tree_label))) {
+        warning("NA values produced when creating tree_label column. Check species_map and temp_match_id.")
+    }
+    if(!is.character(subset_data_matched$tree_label)){
+        warning("tree_label column is not character after creation. Coercing.")
+        subset_data_matched$tree_label <- as.character(subset_data_matched$tree_label)
+    }
+    subset_data_matched <- subset_data_matched %>% dplyr::select(-temp_match_id)
+    
+    # --- Prune Phylogenetic Tree ---
+    # ... (Pruning code remains the same as previous version) ...
+    cat("Pruning tree to", length(tree_labels_to_keep), "tips for this subset.\n")
+    tips_to_drop <- setdiff(full_phylo_tree$tip.label, tree_labels_to_keep)
+    phylo_tree_pruned <- drop.tip(full_phylo_tree, tip = tips_to_drop)
+    if(is.null(phylo_tree_pruned) || !inherits(phylo_tree_pruned, "phylo") || length(phylo_tree_pruned$tip.label) == 0) {
+        stop("Error pruning tree.")
+    }
+     if(length(phylo_tree_pruned$tip.label) != length(tree_labels_to_keep)) {
+       warning("Pruned tree tips (", length(phylo_tree_pruned$tip.label), ") != expected (", length(tree_labels_to_keep), "). Refiltering data.")
+       tree_labels_to_keep <- phylo_tree_pruned$tip.label 
+       subset_data_matched <- subset_data_matched %>% filter(tree_label %in% tree_labels_to_keep)
+       cat(" Refiltered data count:", nrow(subset_data_matched), "\n")
+       if(nrow(subset_data_matched) < 3) { cat("ERROR: < 3 species after refiltering.\n"); return(NULL) }
+    }
+    if(is.null(phylo_tree_pruned$edge.length)) {stop("Pruned tree lost branch lengths!")}
+    cat("Pruned tree verified.\n")
+
+    # --- 3. Create Phylogenetic Covariance Matrix ---
+    # ... (VCV code remains the same) ...
+    cat("Calculating VCV matrix...\n")
+    phylo_cov_matrix <- ape::vcv(phylo_tree_pruned, corr = FALSE)
+    cat("VCV matrix calculated. Dimensions:", dim(phylo_cov_matrix), "\n")
+
+    # --- 4. Prepare Final Data for brms ---
+    # ... (Final column selection, rename, arrange, and alignment checks remain the same) ...
+    cat("Aligning final data with VCV matrix...\n")
+    predictor_cols <- names(subset_data_matched)[grepl("^(PCoA\\d+|n_sequences_scaled|n_recordings_scaled)", names(subset_data_matched))]
+    response_cols_final <- names(subset_data_matched)[grepl("^gmm_prob_", names(subset_data_matched))]
+    if(length(intersect(response_cols_final, names(subset_data_matched))) != length(response_cols_final)){
+         stop("Mismatch between expected final response columns and columns present")
+    }
+    cols_to_keep <- c("tree_label", predictor_cols, response_cols_final, id_col) 
+    if ("learners" %in% names(subset_data_matched)) {
+      cols_to_keep <- c(cols_to_keep, "learners")
+    }
+    cols_to_keep <- unique(cols_to_keep)
+    cols_to_keep <- intersect(cols_to_keep, names(subset_data_matched)) 
+    
+    final_data_prep <- subset_data_matched %>%
+        dplyr::select(all_of(cols_to_keep)) %>%         
+        rename(original_species = !!sym(id_col)) %>% 
+        rename(species = tree_label)             
+
+    if (!"species" %in% names(final_data_prep)) stop("FATAL: 'species' column missing after final rename.")
+    if (!is.character(final_data_prep$species)) {
+         warning("'species' column is not character after final rename. Coercing again.")
+         final_data_prep$species <- as.character(final_data_prep$species)
+    }
+    
+    vcv_rownames <- rownames(phylo_cov_matrix)
+    if (is.null(vcv_rownames)) stop("FATAL: VCV matrix is missing rownames.")
+    
+    final_data <- final_data_prep %>%
+        filter(species %in% vcv_rownames) %>% 
+        arrange(match(species, vcv_rownames)) 
+
+    if (!all(final_data$species == vcv_rownames)) {
+         # ... (Detailed error reporting code remains the same) ...
+         stop("FATAL ERROR: Final data row order does not match VCV matrix order...")
+    }
+    
+    cat("Final species count for model:", nrow(final_data), "\n")
+    cat("Final data columns:", paste(names(final_data), collapse=", "), "\n")
+    
+    # Final check for NAs in responses before returning
+    if(any(is.na(final_data[,response_cols_final]))) {
+       stop("FATAL ERROR: NAs DETECTED in final response columns before returning! Problem in processing.")
+    } else {
+       cat("Final check: No NAs found in response columns.\n")
+    }
+    
+    cat("--- Subset preparation complete. ---\n")
+    
+    # --- Return the prepared list ---
+    return(list(
+        model_data = as.data.frame(final_data), # Return as standard data.frame
+        cov_matrix = phylo_cov_matrix
+        ))
+} # End of prepare_brms_data function
+```
+
+
+
+```{r}
+# --- NEW: Chunk 9c: Apply Preparation Function to Subsets ---
+cat("\n--- Chunk 9c: Preparing Data for Each Model Subset ---\n")
+
+# --- Load Full Tree and Synonyms ONCE ---
+# Load tree if not already loaded
+if (!exists("phylo_tree_full_consensus")) {
+    consensus_tree_file <- "./output/consensus_pruned_tree_plots/consensus_sumtrees.tre"
+    cat(paste("Loading consensus tree from:", consensus_tree_file, "\n"))
+    if (!file.exists(consensus_tree_file)) { stop("Consensus tree file not found.") }
+    phylo_tree_full_consensus <- ape::read.tree(consensus_tree_file)
+    if (!inherits(phylo_tree_full_consensus, "phylo")) { stop("Loaded tree is not phylo object.") }
+    if (is.null(phylo_tree_full_consensus$edge.length)) { stop("Loaded tree lacks branch lengths.") }
+    phylo_tree_full_consensus$tip.label <- str_replace_all(phylo_tree_full_consensus$tip.label, " ", "_")
+    cat("Full consensus tree loaded.\n")
+} else {
+    cat("Using existing 'phylo_tree_full_consensus' object.\n")
+}
+
+# Load synonyms if not already loaded
+if (!exists("synonym_rows_list")) {
+    synonym_file <- "./matching_final_corrected.csv"
+    cat(paste("--- Loading Synonym Data:", synonym_file, "---\n"))
+    synonym_rows_list <- list() # Initialize
+    if (!file.exists(synonym_file)) {
+        warning(paste("Synonym file not found:", synonym_file, "- Matching will use direct names only."))
+    } else {
+        tryCatch({
+            synonym_data_raw <- readr::read_csv(synonym_file, col_types = readr::cols(.default = "c"), show_col_types = FALSE)
+            synonym_data <- synonym_data_raw %>% mutate(across(everything(), ~stringr::str_replace_all(., " ", "_")))
+            synonym_rows_list <- apply(synonym_data, 1, function(row) {
+                unique(as.character(row[!is.na(row) & row != "" & row != "_"]))
+            })
+            synonym_rows_list <- synonym_rows_list[sapply(synonym_rows_list, length) > 0]
+            cat(paste("Loaded and processed synonym data with", length(synonym_rows_list), "potentially useful synonym sets.\n"))
+        }, error = function(e) {
+            warning(paste("Error reading synonym file:", synonym_file, "-", e$message))
+            warning("Synonym matching will be skipped or incomplete.")
+        })
+    }
+} else {
+     cat("Using existing 'synonym_rows_list' object.\n")
+}
+# --- End Loading ---
+
+# Define subsets (requires base_model_data from Chunk 9a)
+if (!exists("base_model_data")) stop("Object 'base_model_data' not found. Run Chunk 9a first.")
+if (!exists("response_vars")) stop("Object 'response_vars' (GMM column names) not found.")
+
+data_overall <- base_model_data
+data_oscines <- base_model_data %>% filter(learners == "Oscines")
+data_nonoscines <- base_model_data %>% filter(learners == "Non-Oscines")
+
+# --- Call the preparation function for each subset ---
+cat("\n--- Preparing OVERALL data ---")
+# Pass the loaded tree and synonyms to the function
+prep_overall <- prepare_brms_data(
+    subset_data = data_overall, 
+    full_phylo_tree = phylo_tree_full_consensus, 
+    response_cols = response_vars, 
+    synonym_list = synonym_rows_list
+    )
+
+cat("\n--- Preparing OSCINES data ---")
+prep_oscines <- prepare_brms_data(
+    subset_data = data_oscines, 
+    full_phylo_tree = phylo_tree_full_consensus, 
+    response_cols = response_vars, 
+    synonym_list = synonym_rows_list
+    )
+
+cat("\n--- Preparing NON-OSCINES data ---")
+prep_nonoscines <- prepare_brms_data(
+    subset_data = data_nonoscines, 
+    full_phylo_tree = phylo_tree_full_consensus, 
+    response_cols = response_vars, 
+    synonym_list = synonym_rows_list
+    )
+
+# Check if all preparations were successful
+if(is.null(prep_overall) || is.null(prep_oscines) || is.null(prep_nonoscines)) {
+    # Specific checks
+    if(is.null(prep_overall)) cat("ERROR: OVERALL data preparation returned NULL.\n")
+    if(is.null(prep_oscines)) cat("ERROR: OSCINES data preparation returned NULL.\n")
+    if(is.null(prep_nonoscines)) cat("ERROR: NON-OSCINES data preparation returned NULL.\n")
+    stop("One or more data subsets failed preparation (likely due to insufficient species after matching). Check logs above.")
+} else {
+    cat("\n--- All data subsets prepared successfully. ---\n")
+    # Optional: Inspect prepared data structure
+    # str(prep_overall, max.level=2) 
+    # str(prep_oscines, max.level=2)
+    # str(prep_nonoscines, max.level=2)
+}
+```
+
+```{r}
+# --- NEW: Chunk 10: Fit the Three Separate Models ---
+cat("\n--- Chunk 10: Fitting the Three Phylogenetic Dirichlet Models ---\n")
+
+# Define the common model formula (ensure axes_present_in_pcoa is defined from original Chunk 9/9a)
+axes_present_in_pcoa <- intersect(paste0("PCoA", 1:3), names(base_model_data)) # Get PCoA names
+fixed_formula_part <- paste(c(axes_present_in_pcoa, scaled_additional_fixed_names), collapse = " + ")
+response_formula_part <- paste0("cbind(", paste(response_vars, collapse = ", "), ")")
+random_formula_part <- "(1 | gr(species, cov = A))"
+model_formula <- brms::bf(paste(response_formula_part, "~", fixed_formula_part, "+", random_formula_part))
+
+cat("Model Formula:\n"); print(model_formula)
+
+# Common settings (from original Chunk 10)
+n_iter <- 2000; n_warmup <- 1000; n_chains <- 4; n_cores <- 12; thin <- 2; seed = 789
+use_approx <- FALSE # Keep as MCMC
+
+# --- Fit Model 1: Overall ---
+cat("\n--- Fitting OVERALL Model ---")
+brm_overall <- NULL
+if (!is.null(prep_overall)) {
+    brm_overall <- tryCatch({
+        brms::brm(
+          formula = model_formula,
+          data = prep_overall$model_data,
+          data2 = list(A = prep_overall$cov_matrix),
+          family = dirichlet(),
+          iter = n_iter, warmup = n_warmup, chains = n_chains, cores = n_cores, thin = thin,
+          control = list(adapt_delta = 0.95, max_treedepth = 12),
+          backend = "cmdstanr", seed = seed, refresh = 100, # Reduced refresh
+          save_pars = save_pars(all = TRUE) )
+    }, error = function(e) { cat("Error fitting OVERALL model:", e$message, "\n"); NULL })
+    
+    if(!is.null(brm_overall)){
+        model_save_file <- file.path(output_dir, "brm_dirichlet_overall_model.rds")
+        saveRDS(brm_overall, file = model_save_file)
+        cat("\nOVERALL model saved to:", model_save_file, "\n")
+    } else { cat("\nOVERALL model fitting failed.\n") }
+} else { cat("\nSkipping OVERALL model fitting - data prep failed.\n")}
+
+
+cat("\n--- All Model Fitting Attempts Complete ---\n")
+```
+
+
+
+
+```{r}
+# --- Fit Model 3: Non-Oscines ---
+
+# Common settings (from original Chunk 10)
+n_iter <- 4000; n_warmup <- 2000; n_chains <- 4; n_cores <- 12; thin <- 2; seed = 789
+use_approx <- FALSE # Keep as MCMC
+
+cat("\n--- Fitting NON-OSCINES Model ---")
+brm_nonoscines <- NULL
+if (!is.null(prep_nonoscines)) {
+
+     # --- Define the Non-Centred Formula and Priors ---
+     # Ensure response_vars, axes_present_in_pcoa, scaled_additional_fixed_names are defined correctly earlier
+    axes_present_in_pcoa <- intersect(paste0("PCoA", 1:3), names(base_model_data)) # Get PCoA names
+     fixed_formula_part_nc <- paste(c(axes_present_in_pcoa, scaled_additional_fixed_names), collapse = " + ")
+     response_formula_part_nc <- paste0("cbind(", paste(response_vars, collapse = ", "), ")")
+     # USE NON-CENTRED PARAMETERIZATION
+     random_formula_part_nc <- "(1 | gr(species, cov = A))"
+     model_formula_nonosc_nc <- brms::bf(paste(response_formula_part_nc, "~", fixed_formula_part_nc, "+", random_formula_part_nc))
+
+     cat("Non-Oscine Model Formula (Non-Centred):\n"); print(model_formula_nonosc_nc)
+
+     # USE PRIORS SUITABLE FOR NON-CENTRED
+     # ------------------------------------------------------------------
+#  Priors for the Non-oscine Dirichlet model
+#  (seven GMM components + concentration parameter)
+# ------------------------------------------------------------------
+
+    priors_nonosc_nc <- c(
+      ## ── population-level effects (β) ────────────────────────────────
+      prior(normal(0, 0.7), class = "b", dpar = "mugmmprob1mean"),
+      prior(normal(0, 0.7), class = "b", dpar = "mugmmprob2mean"),
+      prior(normal(0, 0.7), class = "b", dpar = "mugmmprob3mean"),
+      prior(normal(0, 0.7), class = "b", dpar = "mugmmprob4mean"),
+      prior(normal(0, 0.7), class = "b", dpar = "mugmmprob5mean"),
+      prior(normal(0, 0.7), class = "b", dpar = "mugmmprob6mean"),
+      prior(normal(0, 0.7), class = "b", dpar = "mugmmprob7mean"),
+    
+      ## ── intercepts (α) ─────────────────────────────────────────────
+      prior(normal(0, 0.3), class = "Intercept", dpar = "mugmmprob1mean"),
+      prior(normal(0, 0.3), class = "Intercept", dpar = "mugmmprob2mean"),
+      prior(normal(0, 0.3), class = "Intercept", dpar = "mugmmprob3mean"),
+      prior(normal(0, 0.3), class = "Intercept", dpar = "mugmmprob4mean"),
+      prior(normal(0, 0.3), class = "Intercept", dpar = "mugmmprob5mean"),
+      prior(normal(0, 0.3), class = "Intercept", dpar = "mugmmprob6mean"),
+      prior(normal(0, 0.3), class = "Intercept", dpar = "mugmmprob7mean"),
+    
+      ## ── phylogenetic SDs (random effect for species) ───────────────
+      prior(exponential(1), class = "sd", group = "species", dpar = "mugmmprob1mean"),
+      prior(exponential(1), class = "sd", group = "species", dpar = "mugmmprob2mean"),
+      prior(exponential(1), class = "sd", group = "species", dpar = "mugmmprob3mean"),
+      prior(exponential(1), class = "sd", group = "species", dpar = "mugmmprob4mean"),
+      prior(exponential(1), class = "sd", group = "species", dpar = "mugmmprob5mean"),
+      prior(exponential(1), class = "sd", group = "species", dpar = "mugmmprob6mean"),
+      prior(exponential(1), class = "sd", group = "species", dpar = "mugmmprob7mean"),
+    
+      ## ── concentration parameter φ (shared by all categories) ───────
+      prior(exponential(1), class = "phi")
+    )
+
+     cat("Priors for Non-Oscine Model:\n"); print(priors_nonosc_nc)
+
+     # Control parameters (start moderate)
+     control_nonosc <- list(adapt_delta = 0.97, max_treedepth = 12, stepsize = 0.05)
+     cat("Control Parameters:\n"); print(control_nonosc)
+
+     # --- START DEBUG CHECKS ---
+     cat("\n--- DEBUG: Checking Non-Oscine Data Before brm Call ---\n")
+     cat("Structure of model_data:\n")
+     print(str(prep_nonoscines$model_data))
+     cat("\nSummary of model_data:\n")
+     print(summary(prep_nonoscines$model_data))
+     cat("\nDimensions of cov_matrix:\n")
+     print(dim(prep_nonoscines$cov_matrix))
+     cat("\nFirst 5 rownames of cov_matrix:\n")
+     print(head(rownames(prep_nonoscines$cov_matrix)))
+     cat("\nFirst 5 species in model_data:\n")
+     print(head(prep_nonoscines$model_data$species))
+     cat("\nAre species names matching cov_matrix rownames?\n")
+     print(all(prep_nonoscines$model_data$species == rownames(prep_nonoscines$cov_matrix)))
+     cat("\nResponse variables being used:\n")
+     print(response_vars)
+     cat("\nFixed predictors being used:\n")
+     current_fixed_predictors <- intersect(c(axes_present_in_pcoa, scaled_additional_fixed_names), names(prep_nonoscines$model_data))
+     print(current_fixed_predictors)
+     cat("\nAre all required columns present in model_data?\n")
+     required_cols <- c("species", response_vars, current_fixed_predictors)
+     print(all(required_cols %in% names(prep_nonoscines$model_data)))
+     cat("\nClass of cov_matrix:\n")
+     print(class(prep_nonoscines$cov_matrix))
+     cat("\nMode of cov_matrix:\n") # Should be 'numeric'
+     print(mode(prep_nonoscines$cov_matrix))
+     cat("\nTypes of response columns:\n")
+     print(sapply(prep_nonoscines$model_data[, response_vars], class))
+     cat("\nTypes of predictor columns:\n")
+     if(length(current_fixed_predictors) > 0) {
+        print(sapply(prep_nonoscines$model_data[, current_fixed_predictors], class))
+     } else { cat(" No fixed predictors found in data.\n")}
+     cat("\nCheck for NAs in predictors:\n")
+      if(length(current_fixed_predictors) > 0) {
+        print(sapply(prep_nonoscines$model_data[, current_fixed_predictors], function(x) sum(is.na(x))))
+     } else { cat(" No fixed predictors found in data.\n")}
+     cat("\nCheck for NAs in response:\n")
+     print(sapply(prep_nonoscines$model_data[, response_vars], function(x) sum(is.na(x))))
+     cat("\nCheck for NAs in species ID:\n")
+     print(sum(is.na(prep_nonoscines$model_data$species)))
+     cat("--- END DEBUG ---\n")
+     # --- END DEBUG CHECKS ---
+
+
+     # --- tryCatch block for brm ---
+     brm_nonoscines <- tryCatch({
+      brms::brm(
+        formula = model_formula_nonosc_nc,    # Use the NC formula
+        data = prep_nonoscines$model_data,
+        data2 = list(A = prep_nonoscines$cov_matrix),
+        family = dirichlet(),
+        prior = priors_nonosc_nc,             # Use the NC priors
+        iter = n_iter, warmup = n_warmup,     # Use n_iter, n_warmup defined earlier (e.g., 4000, 2000)
+        chains = n_chains, cores = n_cores, thin = thin,
+        control = control_nonosc,             # Use the defined control list
+        backend = "cmdstanr", seed = seed, refresh = 100,
+        save_pars = save_pars(all = TRUE) )
+    }, error = function(e) {
+        cat("Error fitting NON-OSCINES model:", e$message, "\n")
+        # Optionally print traceback() here for more detailed error source
+        # traceback()
+        NULL
+        })
+    # --- End tryCatch ---
+
+    if(!is.null(brm_nonoscines)){
+        model_save_file <- file.path(output_dir, "brm_dirichlet_nonoscines_model_nc.rds") # Changed filename
+        saveRDS(brm_nonoscines, file = model_save_file)
+        cat("\nNON-OSCINES model (Non-Centred) saved to:", model_save_file, "\n")
+    } else { cat("\nNON-OSCINES model fitting failed.\n") }
+} else { cat("\nSkipping NON-OSCINES model fitting - data prep failed.\n")}
+
+cat("\n--- All Model Fitting Attempts Complete ---\n")
+```
+
+```{r}
+# --- Fit Model 2: Oscines ---
+cat("\n--- Fitting OSCINES Model ---")
+brm_oscines <- NULL
+if (!is.null(prep_oscines)) {
+     brm_oscines <- tryCatch({
+        brms::brm(
+          formula = model_formula,
+          data = prep_oscines$model_data,
+          data2 = list(A = prep_oscines$cov_matrix),
+          family = dirichlet(),
+          iter = n_iter, warmup = n_warmup, chains = n_chains, cores = n_cores, thin = thin,
+          control = list(adapt_delta = 0.95, max_treedepth = 12),
+          backend = "cmdstanr", seed = seed, refresh = 100,
+          save_pars = save_pars(all = TRUE) )
+    }, error = function(e) { cat("Error fitting OSCINES model:", e$message, "\n"); NULL })
+    
+    if(!is.null(brm_oscines)){
+        model_save_file <- file.path(output_dir, "brm_dirichlet_oscines_model.rds")
+        saveRDS(brm_oscines, file = model_save_file)
+        cat("\nOSCINES model saved to:", model_save_file, "\n")
+    } else { cat("\nOSCINES model fitting failed.\n") }
+} else { cat("\nSkipping OSCINES model fitting - data prep failed.\n")}
+
+
+priors_nonosc <- c(prior(normal(0, 1), class = sd))
+```
+
+
+
+
+
+```{r}
+# --- NEW: Chunk 11: Load the Three Fitted Models ---
+cat("\n--- Chunk 11: Loading Fitted Models for Comparison ---\n")
+library(brms)
+library(dplyr)
+library(tibble)
+
+output_dir <- './output/model_species/' # Ensure this is correct
+model_files <- c(
+    Overall = file.path(output_dir, "brm_dirichlet_overall_model.rds"),
+    Oscines = file.path(output_dir, "brm_dirichlet_oscines_model.rds"),
+    NonOscines = file.path(output_dir, "brm_dirichlet_nonoscines_model_nc.rds")
+)
+
+models_list <- list()
+model_names_loaded <- character() # Keep track of successfully loaded models
+for (model_name in names(model_files)) {
+    if (file.exists(model_files[model_name])) {
+        cat("Loading model:", model_name, "from", model_files[model_name], "\n")
+        # Add error handling for loading itself
+        loaded_model <- tryCatch({
+            readRDS(model_files[model_name])
+        }, error = function(e) {
+            warning("Failed to load model '", model_name, "': ", e$message)
+            NULL
+        })
+        
+        if (!is.null(loaded_model) && inherits(loaded_model, "brmsfit")) {
+             models_list[[model_name]] <- loaded_model
+             model_names_loaded <- c(model_names_loaded, model_name) # Add to list of loaded models
+             cat(" Model", model_name, "loaded successfully.\n")
+        } else {
+             warning("Model file for '", model_name, "' loaded as NULL or is not a brmsfit object.")
+        }
+    } else {
+        warning("Model file not found for:", model_name, "at", model_files[model_name])
+    }
+}
+
+if (length(models_list) == 0) {
+    stop("FATAL: No models were loaded successfully. Cannot proceed with comparison.")
+} else if (length(models_list) < 3) {
+    warning("Not all models were loaded successfully. Comparison will be based on loaded models: ", paste(model_names_loaded, collapse=", "))
+} else {
+    cat("All 3 models loaded successfully.\n")
+}
+
+# --- Load necessary mappings (ensure these were defined in earlier chunks) ---
+cat("Checking for required mappings...\n")
+if (!exists("strategy_names")) { stop("strategy_names mapping not found. Rerun the chunk where it's defined (likely Chunk 3c or 12).") }
+if (!exists("reference_strategy_name")) { 
+    # Try to derive reference strategy name if missing
+    reference_strategy_name <- strategy_names["0"] 
+    if(is.na(reference_strategy_name)) stop("Reference strategy name (for index 0) could not be found in strategy_names.")
+     cat("NOTE: 'reference_strategy_name' derived from strategy_names['0'].\n")
+}
+if (!exists("brms_dpar_to_gmm_index")) { 
+    # Try to derive mapping if missing
+    brms_dpar_to_gmm_index <- setNames(1:7, paste0("mugmmprob", 1:7, "mean"))
+    cat("NOTE: 'brms_dpar_to_gmm_index' mapping recreated.\n")
+}
+cat("Mappings seem ok.\n")
+```
+
+```{r}
+# --- Simple Chunk 12: Basic Model Statistics and R² ---
+cat("\n--- Chunk 12: Basic Model Statistics ---\n")
+
+library(brms)
+library(dplyr)
+library(knitr)
+
+# Check that models exist
+if (!exists("models_list") || length(models_list) == 0) {
+    stop("No models found in models_list.")
+}
+
+# Initialize storage
+model_stats <- data.frame()
+
+# ============================================================
+# Extract Statistics for Each Model
+# ============================================================
+
+for (model_name in names(models_list)) {
+    cat("\n=== Processing:", model_name, "===\n")
+    model <- models_list[[model_name]]
+    
+    # --- 1. Basic Info ---
+    n_species <- nrow(model$data)
+    cat(sprintf("  Species: %d\n", n_species))
+    
+    # --- 2. Try Bayes R² ---
+    bayes_r2_result <- tryCatch({
+        r2 <- bayes_R2(model)
+        mean_r2 <- mean(r2[, "Estimate"])
+        list(r2 = mean_r2, method = "bayes_R2")
+    }, error = function(e) {
+        cat("  Bayes R² not available for Dirichlet, trying predictive R²...\n")
+        NULL
+    })
+    
+    # --- 3. Calculate Predictive R² (correlation-based) ---
+    if (is.null(bayes_r2_result)) {
+        pred_r2_result <- tryCatch({
+            # Get posterior predictions
+            posterior_preds <- posterior_predict(model, ndraws = 100)
+            
+            # Calculate mean predictions across draws
+            mean_preds <- apply(posterior_preds, c(2, 3), mean)
+            
+            # Get observed values (response variables)
+            response_cols <- grep("^gmm_prob_", names(model$data), value = TRUE)
+            observed <- as.matrix(model$data[, response_cols])
+            
+            # Calculate correlation between observed and predicted
+            # For compositional data, we calculate correlation for each response
+            correlations <- numeric(length(response_cols))
+            for (i in seq_along(response_cols)) {
+                correlations[i] <- cor(observed[, i], mean_preds[, i])
+            }
+            
+            # Mean correlation across all responses
+            mean_r <- mean(correlations)
+            # Convert to R² (squared correlation)
+            pred_r2 <- mean_r^2
+            
+            list(r2 = pred_r2, method = "predictive_correlation")
+        }, error = function(e) {
+            cat("  Could not calculate predictive R²:", e$message, "\n")
+            NULL
+        })
+        
+        bayes_r2_result <- pred_r2_result
+    }
+    
+    r2_value <- NA
+    r2_method <- "Not available"
+    if (!is.null(bayes_r2_result)) {
+        r2_value <- bayes_r2_result$r2
+        r2_method <- bayes_r2_result$method
+        cat(sprintf("  R² = %.3f (method: %s)\n", r2_value, r2_method))
+    }
+    
+    # --- 4. Count Credible Effects ---
+    fixed_effects <- fixef(model)
+    
+    # Credible = 95% CI excludes zero
+    ci_excludes_zero <- (fixed_effects[, "Q2.5"] > 0 & fixed_effects[, "Q97.5"] > 0) | 
+                        (fixed_effects[, "Q2.5"] < 0 & fixed_effects[, "Q97.5"] < 0)
+    
+    n_credible <- sum(ci_excludes_zero)
+    n_total <- nrow(fixed_effects)
+    
+    cat(sprintf("  Credible effects: %d/%d (%.0f%%)\n", 
+                n_credible, n_total, (n_credible/n_total)*100))
+    
+    # --- 5. Phylogenetic Signal ---
+    random_effects <- VarCorr(model)
+    phylo_sds <- numeric()
+    
+    for (resp_name in names(random_effects)) {
+        if (grepl("mu", resp_name)) {
+            phylo_sd <- random_effects[[resp_name]]$sd["Intercept", "Estimate"]
+            phylo_sds <- c(phylo_sds, phylo_sd)
+        }
+    }
+    
+    mean_phylo_sd <- ifelse(length(phylo_sds) > 0, mean(phylo_sds), NA)
+    cat(sprintf("  Mean phylogenetic SD: %.3f\n", mean_phylo_sd))
+    
+    # --- 6. Store Results ---
+    stats_row <- data.frame(
+        Model = model_name,
+        N_Species = n_species,
+        R2 = round(r2_value, 3),
+        R2_Method = r2_method,
+        Credible_Effects = sprintf("%d/%d", n_credible, n_total),
+        Pct_Credible = round((n_credible/n_total)*100, 1),
+        Mean_Phylo_SD = round(mean_phylo_sd, 3)
+    )
+    
+    model_stats <- rbind(model_stats, stats_row)
+}
+
+# ============================================================
+# Display Summary Table
+# ============================================================
+cat("\n\n=== MODEL STATISTICS SUMMARY ===\n")
+print(kable(model_stats, 
+            caption = "Basic Model Statistics",
+            col.names = c("Model", "N Species", "R²", "R² Method", 
+                         "Credible Effects", "% Credible", "Phylo Signal")))
+
+
+cat("\n=== Chunk 12 Complete ===\n")
+```
+
+```{r}
+# --- Chunk 12: Comprehensive Biological Model Performance Metrics ---
+cat("\n--- Chunk 12: Biological Model Performance (All Metrics) ---\n")
+
+library(brms)
+library(dplyr)
+library(knitr)
+library(ggplot2)
+library(tidyr)
+
+# Check that models exist
+if (!exists("models_list") || length(models_list) == 0) {
+    stop("No models found in models_list.")
+}
+
+# Define strategy names for interpretability
+strategy_names <- c(
+    "Flat Whistles", "Slow Trills", "Fast Trills", "Noisy Songs",
+    "Ultrafast Trills", "Slow Modulated Whistles", 
+    "Fast Modulated Whistles", "Harmonic Stacks"
+)
+
+# Initialize storage
+model_performance_summary <- data.frame()
+strategy_performance_list <- list()
+all_credible_effects <- list()
+
+# ============================================================
+# Calculate All Metrics for Each Model
+# ============================================================
+
+for (model_name in names(models_list)) {
+    cat("\n========================================\n")
+    cat("=== Processing:", model_name, "===\n")
+    cat("========================================\n")
+    
+    model <- models_list[[model_name]]
+    n_species <- nrow(model$data)
+    
+    # Get posterior predictions
+    cat("  Generating posterior predictions...\n")
+    posterior_preds <- posterior_predict(model, ndraws = 100)
+    mean_preds <- apply(posterior_preds, c(2, 3), mean)
+    
+    # Get observed values
+    response_cols <- grep("^gmm_prob_", names(model$data), value = TRUE)
+    observed <- as.matrix(model$data[, response_cols])
+    
+    # Ensure dimensions match
+    if (ncol(observed) != ncol(mean_preds)) {
+        stop(sprintf("Dimension mismatch for %s: observed has %d cols, predicted has %d cols", 
+                    model_name, ncol(observed), ncol(mean_preds)))
+    }
+    
+    # --------------------------------------------------------
+    # METRIC 1: Mean Absolute Error (MAE)
+    # --------------------------------------------------------
+    cat("\n  [1] Calculating Mean Absolute Error...\n")
+    mae_overall <- mean(abs(observed - mean_preds))
+    mae_pct <- mae_overall * 100
+    
+    # MAE per strategy
+    mae_per_strategy <- colMeans(abs(observed - mean_preds)) * 100
+    names(mae_per_strategy) <- strategy_names[1:length(mae_per_strategy)]
+    
+    cat(sprintf("      Overall MAE: %.1f percentage points\n", mae_pct))
+    cat("      MAE by strategy (pp):\n")
+    for (i in seq_along(mae_per_strategy)) {
+        cat(sprintf("        %s: %.1f\n", names(mae_per_strategy)[i], mae_per_strategy[i]))
+    }
+    
+    # --------------------------------------------------------
+    # METRIC 2: Dominant Strategy Accuracy
+    # --------------------------------------------------------
+    cat("\n  [2] Calculating Dominant Strategy Accuracy...\n")
+    observed_dominant <- apply(observed, 1, which.max)
+    predicted_dominant <- apply(mean_preds, 1, which.max)
+    
+    dominant_accuracy <- mean(observed_dominant == predicted_dominant) * 100
+    
+    # Also calculate "within top 2" accuracy
+    get_top2 <- function(x) order(x, decreasing = TRUE)[1:2]
+    observed_top2 <- apply(observed, 1, get_top2)
+    predicted_top2 <- apply(mean_preds, 1, get_top2)
+    
+    top2_accuracy <- mean(sapply(1:ncol(observed_top2), function(i) {
+        any(predicted_top2[, i] %in% observed_top2[, i])
+    })) * 100
+    
+    cat(sprintf("      Dominant strategy correct: %.1f%% of species\n", dominant_accuracy))
+    cat(sprintf("      Top-2 strategy overlap: %.1f%% of species\n", top2_accuracy))
+    
+    # --------------------------------------------------------
+    # METRIC 3: Strategy-Specific Correlations (R²)
+    # --------------------------------------------------------
+    cat("\n  [3] Calculating Strategy-Specific R²...\n")
+    strategy_r2 <- numeric(ncol(observed))
+    strategy_correlations <- numeric(ncol(observed))
+    names(strategy_r2) <- strategy_names[1:ncol(observed)]
+    names(strategy_correlations) <- strategy_names[1:ncol(observed)]
+    
+    for (i in 1:ncol(observed)) {
+        cor_val <- cor(observed[, i], mean_preds[, i])
+        strategy_correlations[i] <- cor_val
+        strategy_r2[i] <- cor_val^2
+    }
+    
+    mean_strategy_r2 <- mean(strategy_r2)
+    
+    cat(sprintf("      Mean R² across strategies: %.3f\n", mean_strategy_r2))
+    cat("      R² by strategy:\n")
+    for (i in seq_along(strategy_r2)) {
+        cat(sprintf("        %s: %.3f (r = %.3f)\n", 
+                   names(strategy_r2)[i], strategy_r2[i], strategy_correlations[i]))
+    }
+    
+    # Store strategy-specific performance
+    strategy_perf_df <- data.frame(
+        Model = model_name,
+        Strategy = names(strategy_r2),
+        R2 = round(strategy_r2, 3),
+        Correlation = round(strategy_correlations, 3),
+        MAE_pp = round(mae_per_strategy, 1)
+    )
+    strategy_performance_list[[model_name]] <- strategy_perf_df
+    
+    # --------------------------------------------------------
+    # METRIC 4: Proportion Well-Predicted (±10pp threshold)
+    # --------------------------------------------------------
+    cat("\n  [4] Calculating Proportion of Well-Predicted Species...\n")
+    species_mae <- rowMeans(abs(observed - mean_preds))
+    
+    # Multiple thresholds
+    threshold_5pp <- mean(species_mae < 0.05) * 100
+    threshold_10pp <- mean(species_mae < 0.10) * 100
+    threshold_15pp <- mean(species_mae < 0.15) * 100
+    
+    cat(sprintf("      Species within ±5pp:  %.1f%%\n", threshold_5pp))
+    cat(sprintf("      Species within ±10pp: %.1f%%\n", threshold_10pp))
+    cat(sprintf("      Species within ±15pp: %.1f%%\n", threshold_15pp))
+    
+    # --------------------------------------------------------
+    # BONUS: Credible Effects Count
+    # --------------------------------------------------------
+    cat("\n  [5] Counting Credible Effects...\n")
+    fixed_effects <- fixef(model)
+    
+    ci_excludes_zero <- (fixed_effects[, "Q2.5"] > 0 & fixed_effects[, "Q97.5"] > 0) | 
+                        (fixed_effects[, "Q2.5"] < 0 & fixed_effects[, "Q97.5"] < 0)
+    
+    n_credible <- sum(ci_excludes_zero)
+    n_total <- nrow(fixed_effects)
+    pct_credible <- (n_credible / n_total) * 100
+    
+    # Store which effects are credible
+    credible_effect_names <- rownames(fixed_effects)[ci_excludes_zero]
+    all_credible_effects[[model_name]] <- credible_effect_names
+    
+    cat(sprintf("      Credible effects: %d/%d (%.1f%%)\n", 
+                n_credible, n_total, pct_credible))
+    if (length(credible_effect_names) > 0) {
+        cat("      Credible predictors:\n")
+        for (eff in credible_effect_names) {
+            cat(sprintf("        - %s: [%.3f, %.3f]\n", 
+                       eff, fixed_effects[eff, "Q2.5"], fixed_effects[eff, "Q97.5"]))
+        }
+    }
+    
+    # --------------------------------------------------------
+    # Store Summary Row
+    # --------------------------------------------------------
+    summary_row <- data.frame(
+        Model = model_name,
+        N_Species = n_species,
+        MAE_pp = round(mae_pct, 1),
+        Dominant_Accuracy_pct = round(dominant_accuracy, 1),
+        Top2_Accuracy_pct = round(top2_accuracy, 1),
+        Mean_Strategy_R2 = round(mean_strategy_r2, 3),
+        Species_within_5pp_pct = round(threshold_5pp, 1),
+        Species_within_10pp_pct = round(threshold_10pp, 1),
+        Species_within_15pp_pct = round(threshold_15pp, 1),
+        Credible_Effects = sprintf("%d/%d", n_credible, n_total),
+        Pct_Credible = round(pct_credible, 1)
+    )
+    
+    model_performance_summary <- rbind(model_performance_summary, summary_row)
+}
+
+# ============================================================
+# Display Summary Tables
+# ============================================================
+cat("\n\n========================================\n")
+cat("=== OVERALL MODEL PERFORMANCE SUMMARY ===\n")
+cat("========================================\n\n")
+
+print(kable(model_performance_summary, 
+            caption = "Model Performance: All Biological Metrics",
+            col.names = c("Model", "N Species", "MAE (pp)", "Dom. Acc. (%)", 
+                         "Top-2 Acc. (%)", "Mean R²", 
+                         "±5pp (%)", "±10pp (%)", "±15pp (%)",
+                         "Credible Eff.", "% Credible")))
+
+# --------------------------------------------------------
+# Strategy-Specific Performance Table
+# --------------------------------------------------------
+cat("\n\n========================================\n")
+cat("=== STRATEGY-SPECIFIC PERFORMANCE ===\n")
+cat("========================================\n\n")
+
+all_strategy_perf <- bind_rows(strategy_performance_list)
+
+# Reshape for better display: strategies as rows, models as columns
+strategy_r2_wide <- all_strategy_perf %>%
+    select(Model, Strategy, R2) %>%
+    pivot_wider(names_from = Model, values_from = R2)
+
+print(kable(strategy_r2_wide, 
+            caption = "R² by Acoustic Strategy and Model",
+            digits = 3))
+
+# Also show which strategy is best/worst predicted per model
+cat("\n--- Best and Worst Predicted Strategies ---\n")
+for (model_name in names(strategy_performance_list)) {
+    df <- strategy_performance_list[[model_name]]
+    best_idx <- which.max(df$R2)
+    worst_idx <- which.min(df$R2)
+    
+    cat(sprintf("\n%s:\n", model_name))
+    cat(sprintf("  Best:  %s (R² = %.3f, MAE = %.1fpp)\n", 
+               df$Strategy[best_idx], df$R2[best_idx], df$MAE_pp[best_idx]))
+    cat(sprintf("  Worst: %s (R² = %.3f, MAE = %.1fpp)\n", 
+               df$Strategy[worst_idx], df$R2[worst_idx], df$MAE_pp[worst_idx]))
+}
+
+# ============================================================
+# Generate Visualizations
+# ============================================================
+cat("\n\n========================================\n")
+cat("=== GENERATING VISUALIZATION PLOTS ===\n")
+cat("========================================\n")
+
+# Plot 1: Strategy-Specific R² across models
+cat("\n  Creating strategy R² comparison plot...\n")
+p_strategy_r2 <- ggplot(all_strategy_perf, 
+                        aes(x = reorder(Strategy, -R2), y = R2, fill = Model)) +
+    geom_col(position = "dodge", alpha = 0.8) +
+    scale_y_continuous(limits = c(0, 1), expand = c(0, 0)) +
+    labs(title = "Predictive Performance by Acoustic Strategy",
+         subtitle = "R² (correlation between observed and predicted proportions)",
+         x = "Acoustic Strategy",
+         y = "R²") +
+    theme_minimal(base_size = 11) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          legend.position = "bottom") +
+    geom_hline(yintercept = 0.5, linetype = "dashed", color = "red", alpha = 0.5)
+
+print(p_strategy_r2)
+ggsave(file.path(output_dir, "strategy_specific_R2.png"), 
+       p_strategy_r2, width = 10, height = 6, dpi = 300)
+
+# Plot 2: MAE by strategy
+cat("  Creating strategy MAE comparison plot...\n")
+p_strategy_mae <- ggplot(all_strategy_perf, 
+                         aes(x = reorder(Strategy, MAE_pp), y = MAE_pp, fill = Model)) +
+    geom_col(position = "dodge", alpha = 0.8) +
+    scale_y_continuous(expand = c(0, 0)) +
+    labs(title = "Prediction Error by Acoustic Strategy",
+         subtitle = "Mean Absolute Error (lower is better)",
+         x = "Acoustic Strategy",
+         y = "MAE (percentage points)") +
+    theme_minimal(base_size = 11) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          legend.position = "bottom")
+
+print(p_strategy_mae)
+ggsave(file.path(output_dir, "strategy_specific_MAE.png"), 
+       p_strategy_mae, width = 10, height = 6, dpi = 300)
+```
+
+
+
+```{r}
+cat("\n--- Chunk 12: Enhanced Model Statistics for Dirichlet Models ---\n")
+
+library(brms)
+library(dplyr)
+library(knitr)
+library(ggplot2)
+
+# Check that models are loaded
+if (!exists("models_list") || length(models_list) == 0) {
+    stop("No models found in models_list. Please run Chunk 11 first.")
+}
+
+# Initialize results storage
+model_stats_list <- list()
+paper_stats <- list()
+
+# --- 1. Basic Model Information ---
+cat("\n=== MODEL INFORMATION ===\n")
+convergence_summary <- data.frame()
+
+for (model_name in names(models_list)) {
+    cat("\n--- Model:", model_name, "---\n")
+    model <- models_list[[model_name]]
+    
+    # Get basic info
+    n_species <- nrow(model$data)
+    n_chains <- model$fit@sim$chains
+    n_iter <- model$fit@sim$iter
+    n_warmup <- model$fit@sim$warmup
+    n_samples <- (n_iter - n_warmup) * n_chains
+    
+    # Extract Rhat from model summary
+    model_summary <- summary(model)
+    max_rhat <- NA
+    converged <- "Unknown"
+    
+    tryCatch({
+        if (!is.null(model_summary$fixed)) {
+            rhats <- model_summary$fixed[, "Rhat"]
+            max_rhat <- max(rhats, na.rm = TRUE)
+            converged <- ifelse(max_rhat < 1.01, "Yes", "No")
+        }
+    }, error = function(e) {
+        cat("  Warning: Could not extract Rhat for", model_name, "\n")
+    })
+    
+    conv_stats <- data.frame(
+        Model = model_name,
+        N_Species = n_species,
+        Total_Samples = n_samples,
+        Max_Rhat = round(max_rhat, 3),
+        Converged = converged
+    )
+    
+    convergence_summary <- rbind(convergence_summary, conv_stats)
+    model_stats_list[[model_name]] <- list(convergence = conv_stats)
+}
+
+print(kable(convergence_summary, caption = "Model Convergence Summary"))
+
+# --- 2. Calculate Pseudo R² for Dirichlet Models ---
+cat("\n\n=== PSEUDO R-SQUARED (Variance Explained) ===\n")
+
+calculate_pseudo_r2 <- function(model) {
+    tryCatch({
+        # Method 1: Variance decomposition approach
+        random_effects <- VarCorr(model)
+        
+        # Extract phylogenetic variances
+        phylo_vars <- numeric()
+        for (resp_name in names(random_effects)) {
+            if (grepl("mugmmprob", resp_name)) {
+                phylo_sd <- random_effects[[resp_name]]$sd["Intercept", "Estimate"]
+                phylo_vars <- c(phylo_vars, phylo_sd^2)
+            }
+        }
+        
+        if (length(phylo_vars) > 0) {
+            mean_phylo_var <- mean(phylo_vars)
+            # Approximate total variance for Dirichlet (phylogenetic + residual)
+            # For Dirichlet, residual variance is approximately π²/3 ≈ 3.29
+            total_var <- mean_phylo_var + 3.29
+            pseudo_r2 <- mean_phylo_var / total_var
+            
+            return(list(
+                pseudo_r2 = pseudo_r2,
+                phylo_var = mean_phylo_var,
+                total_var = total_var,
+                method = "variance_decomposition"
+            ))
+        }
+        
+        return(NULL)
+        
+    }, error = function(e) {
+        cat("Error calculating pseudo R² for model:", e$message, "\n")
+        return(NULL)
+    })
+}
+
+r2_results <- list()
+for (model_name in names(models_list)) {
+    cat("Calculating pseudo R² for", model_name, "...\n")
+    r2_result <- calculate_pseudo_r2(models_list[[model_name]])
+    
+    if (!is.null(r2_result)) {
+        r2_results[[model_name]] <- r2_result
+        model_stats_list[[model_name]]$pseudo_r2 <- round(r2_result$pseudo_r2, 3)
+        
+        cat(sprintf("  %s: Pseudo R² = %.3f (%.1f%% variance explained)\n", 
+                   model_name, r2_result$pseudo_r2, r2_result$pseudo_r2 * 100))
+    } else {
+        cat(sprintf("  %s: Could not calculate pseudo R²\n", model_name))
+        model_stats_list[[model_name]]$pseudo_r2 <- NA
+    }
+}
+
+# --- 3. Model Comparison and Significance Testing ---
+cat("\n\n=== MODEL SIGNIFICANCE (Null Model Comparison) ===\n")
+
+# For Dirichlet models, we'll compare LOO-IC to assess model significance
+# Since we can't directly compare due to different sample sizes, we'll use effect sizes
+
+for (model_name in names(models_list)) {
+    cat("\n--- Model:", model_name, "significance assessment ---\n")
+    model <- models_list[[model_name]]
+    
+    # Count significant fixed effects as proxy for model performance
+    fixed_summary <- fixef(model)
+    n_significant <- sum((fixed_summary[, "Q2.5"] > 0 & fixed_summary[, "Q97.5"] > 0) | 
+                        (fixed_summary[, "Q2.5"] < 0 & fixed_summary[, "Q97.5"] < 0))
+    n_total <- nrow(fixed_summary)
+    
+    prop_significant <- n_significant / n_total
+    
+    # Approximate p-value based on proportion of significant effects
+    # This is a heuristic - in Bayesian context, "significance" is about credible intervals
+    if (prop_significant > 0.5) {
+        approx_p <- "< 0.001"  # High proportion of significant effects
+    } else if (prop_significant > 0.3) {
+        approx_p <- "< 0.01"   # Moderate proportion
+    } else if (prop_significant > 0.1) {
+        approx_p <- "< 0.05"   # Some effects
+    } else {
+        approx_p <- "> 0.05"   # Few significant effects
+    }
+    
+    model_stats_list[[model_name]]$n_significant_effects <- n_significant
+    model_stats_list[[model_name]]$n_total_effects <- n_total
+    model_stats_list[[model_name]]$prop_significant <- round(prop_significant, 3)
+    model_stats_list[[model_name]]$approx_p <- approx_p
+    
+    cat(sprintf("  Significant effects: %d/%d (%.1f%%)\n", 
+               n_significant, n_total, prop_significant * 100))
+    cat(sprintf("  Approximate significance: P %s\n", approx_p))
+}
+
+# --- 4. Extract Phylogenetic Signal ---
+cat("\n\n=== PHYLOGENETIC SIGNAL ===\n")
+phylo_summary <- data.frame()
+
+for (model_name in names(models_list)) {
+    model <- models_list[[model_name]]
+    
+    # Get random effects
+    random_summary <- VarCorr(model)
+    
+    phylo_sds <- numeric()
+    for (resp_name in names(random_summary)) {
+        if (grepl("mugmmprob", resp_name)) {
+            phylo_sd <- random_summary[[resp_name]]$sd["Intercept", "Estimate"]
+            phylo_sds <- c(phylo_sds, phylo_sd)
+            
+            phylo_stats <- data.frame(
+                Model = model_name,
+                Response = resp_name,
+                Phylo_SD = round(phylo_sd, 3)
+            )
+            phylo_summary <- rbind(phylo_summary, phylo_stats)
+        }
+    }
+    
+    if (length(phylo_sds) > 0) {
+        mean_phylo_sd <- mean(phylo_sds)
+        model_stats_list[[model_name]]$mean_phylo_sd <- round(mean_phylo_sd, 3)
+        cat(sprintf("%s: Mean phylogenetic SD = %.3f\n", model_name, mean_phylo_sd))
+    }
+}
+
+if (nrow(phylo_summary) > 0) {
+    mean_phylo <- phylo_summary %>%
+        group_by(Model) %>%
+        summarise(
+            Mean_Phylo_SD = round(mean(Phylo_SD), 3),
+            Min_Phylo_SD = round(min(Phylo_SD), 3),
+            Max_Phylo_SD = round(max(Phylo_SD), 3),
+            .groups = "drop"
+        )
+    
+    print(kable(mean_phylo, caption = "Phylogenetic Signal Summary"))
+}
+
+# --- 5. LOO-IC Calculation (with better error handling) ---
+cat("\n\n=== LOO-IC CALCULATION ===\n")
+
+for (model_name in names(models_list)) {
+    cat("Computing LOO for", model_name, "...\n")
+    
+    loo_result <- tryCatch({
+        loo(models_list[[model_name]], cores = 2, moment_match = TRUE)
+    }, error = function(e) {
+        cat("  LOO failed, trying without moment matching...\n")
+        tryCatch({
+            loo(models_list[[model_name]], cores = 2)
+        }, error = function(e2) {
+            cat("  LOO computation failed:", e2$message, "\n")
+            NULL
+        })
+    })
+    
+    if (!is.null(loo_result)) {
+        looic_val <- loo_result$estimates["looic", "Estimate"]
+        looic_se <- loo_result$estimates["looic", "SE"]
+        
+        model_stats_list[[model_name]]$looic <- round(looic_val, 1)
+        model_stats_list[[model_name]]$looic_se <- round(looic_se, 1)
+        
+        cat(sprintf("  %s: LOO-IC = %.1f (±%.1f)\n", model_name, looic_val, looic_se))
+    }
+}
+
+# --- 6. Create Paper Summary Table ---
+cat("\n\n=== SUMMARY FOR PAPER ===\n")
+
+paper_summary <- data.frame()
+for (model_name in names(model_stats_list)) {
+    stats <- model_stats_list[[model_name]]
+    
+    summary_row <- data.frame(
+        Model = model_name,
+        N_Species = stats$convergence$N_Species,
+        Pseudo_R2 = ifelse(!is.null(stats$pseudo_r2), 
+                          sprintf("%.3f", stats$pseudo_r2), "NA"),
+        Variance_Explained = ifelse(!is.null(stats$pseudo_r2), 
+                                   paste0(round(stats$pseudo_r2 * 100, 1), "%"), "NA"),
+        Approx_P = ifelse(!is.null(stats$approx_p), stats$approx_p, "NA"),
+        Significant_Effects = paste0(stats$n_significant_effects, "/", stats$n_total_effects),
+        Mean_Phylo_Signal = ifelse(!is.null(stats$mean_phylo_sd), 
+                                  sprintf("%.3f", stats$mean_phylo_sd), "NA"),
+        LOO_IC = ifelse(!is.null(stats$looic), sprintf("%.1f", stats$looic), "NA"),
+        Converged = stats$convergence$Converged
+    )
+    paper_summary <- rbind(paper_summary, summary_row)
+}
+
+print(kable(paper_summary, 
+           caption = "Model Statistics for Paper",
+           col.names = c("Model", "N Species", "Pseudo R²", "Var. Explained", 
+                        "Approx. P", "Sig. Effects", "Phylo Signal", "LOO-IC", "Converged")))
+
+# --- 7. Generate Text for Paper ---
+cat("\n\n=== TEXT FOR PAPER ===\n")
+
+# Extract overall model statistics for the paper text
+if ("Overall" %in% names(model_stats_list)) {
+    overall_stats <- model_stats_list[["Overall"]]
+    
+    var_explained <- ifelse(!is.null(overall_stats$pseudo_r2), 
+                           round(overall_stats$pseudo_r2 * 100, 1), "XX.X")
+    r_squared <- ifelse(!is.null(overall_stats$pseudo_r2), 
+                       sprintf("%.3f", overall_stats$pseudo_r2), "X.XXX")
+    p_value <- ifelse(!is.null(overall_stats$approx_p), 
+                     overall_stats$approx_p, "X.XXX")
+    
+    paper_text <- sprintf(
+        "Altogether these three dimensions explain a substantial portion (%s%%) of the total variation of a species' acoustic syndromes (Principal Coordinates Analysis followed by a Dirichlet regression model, Model Pseudo R² = %s, P %s; Fig. 2B).",
+        var_explained, r_squared, p_value
+    )
+    
+    cat("\n--- SUGGESTED TEXT FOR PAPER ---\n")
+    cat(paper_text)
+    cat("\n\n--- ALTERNATIVE VERSION (more conservative) ---\n")
+    cat(sprintf(
+        "These morphological and ecological predictors explained %s%% of the variance in acoustic strategies (Bayesian Dirichlet regression with phylogenetic effects, pseudo R² = %s, %d/%d predictors had credible intervals excluding zero).",
+        var_explained, r_squared, overall_stats$n_significant_effects, overall_stats$n_total_effects
+    ))
+} else {
+    cat("No 'Overall' model found for paper text generation.\n")
+}
+
+# --- 8. Save Results ---
+output_stats_file <- file.path(output_dir, "model_statistics_dirichlet_summary.csv")
+write.csv(paper_summary, output_stats_file, row.names = FALSE)
+cat(sprintf("\n\nStatistics summary saved to: %s\n", output_stats_file))
+
+# Save detailed results
+detailed_stats_file <- file.path(output_dir, "detailed_model_statistics.rds")
+saveRDS(model_stats_list, detailed_stats_file)
+cat(sprintf("Detailed statistics saved to: %s\n", detailed_stats_file))
+
+cat("\n--- Enhanced Model Statistics Complete ---\n")
+```
+
+
+```{r}
+# --- REVISED v2: Chunk 11b: Check Model Convergence and Diagnostics (Save Traces Directly) ---
+cat("\n--- Chunk 11b: Checking Model Convergence and Diagnostics (Save Traces Directly) ---\n")
+
+# Required libraries
+library(brms)
+library(dplyr)
+library(tibble)
+# No ggplot2 needed here if only saving with png()
+library(fs)
+
+# Check if models_list exists and has content
+if (!exists("models_list") || length(models_list) == 0) {
+    stop("Models list ('models_list') not found or empty. Cannot perform checks. Run Chunk 11 first.")
+}
+
+# --- Define Thresholds ---
+rhat_threshold <- 1.05
+neff_ratio_threshold <- 0.1
+
+# --- Initialize Tracking Variables ---
+all_models_converged <- TRUE
+models_with_rhat_issues <- character()
+models_with_neff_issues <- character()
+models_with_divergences <- character()
+
+# --- Setup Output Directory for Plots ---
+if (!exists("output_dir")) {
+    warning("'output_dir' not defined. Using './output/model_species/' for diagnostic plots.")
+    output_dir <- './output/model_species/'
+}
+diag_plot_dir <- file.path(output_dir, "model_diagnostics")
+fs::dir_create(diag_plot_dir)
+cat(paste("Saving diagnostic plots to:", diag_plot_dir, "\n"))
+
+cat("Checking convergence for models:", paste(names(models_list), collapse=", "), "\n")
+cat(paste("Using R-hat threshold:", rhat_threshold, "\n"))
+cat(paste("Using Neff Ratio threshold:", neff_ratio_threshold, "\n"))
+
+# --- Loop Through Each Loaded Model ---
+for (model_name in names(models_list)) {
+    cat("\n>>> Checking Model:", model_name, "<<<\n")
+    model <- models_list[[model_name]]
+    model_converged_current <- TRUE
+
+    if (!inherits(model, "brmsfit")) {
+        cat("  WARNING: Object is not a brmsfit object. Skipping checks.\n")
+        all_models_converged <- FALSE
+        model_converged_current <- FALSE
+        next
+    }
+
+    # 1. Check R-hat (same as before)
+    cat("  - Checking R-hat...")
+    rhats <- tryCatch({ brms::rhat(model) }, error = function(e) { cat(" Error:", e$message, "\n"); NULL })
+    if (!is.null(rhats)) {
+        if (any(rhats > rhat_threshold, na.rm = TRUE)) {
+            cat(" WARNING: High R-hat values detected! (Max =", round(max(rhats, na.rm=TRUE), 3), ")\n")
+            all_models_converged <- FALSE; model_converged_current <- FALSE; models_with_rhat_issues <- c(models_with_rhat_issues, model_name)
+        } else { cat(" OK (All <=", rhat_threshold, ")\n") }
+    } else { all_models_converged <- FALSE; model_converged_current <- FALSE }
+
+    # 2. Check Neff Ratio (same as before)
+    cat("  - Checking Neff Ratio...")
+    neff_ratios <- tryCatch({ brms::neff_ratio(model) }, error = function(e) { cat(" Error:", e$message, "\n"); NULL })
+    if (!is.null(neff_ratios)) {
+        if (any(neff_ratios < neff_ratio_threshold, na.rm = TRUE)) {
+            cat(" WARNING: Low Neff ratios detected! (Min =", round(min(neff_ratios, na.rm=TRUE), 3), ")\n")
+            all_models_converged <- FALSE; model_converged_current <- FALSE; models_with_neff_issues <- c(models_with_neff_issues, model_name)
+        } else { cat(" OK (All >=", neff_ratio_threshold, ")\n") }
+    } else { all_models_converged <- FALSE; model_converged_current <- FALSE }
+
+    # 3. Check Divergent Transitions (same as before)
+    cat("  - Checking Divergent Transitions...")
+    nuts_params <- tryCatch({ brms::nuts_params(model) }, error = function(e) { cat(" Error:", e$message, "\n"); NULL })
+    if (!is.null(nuts_params)) {
+        divergences <- sum(nuts_params$divergent__)
+        if (divergences > 0) {
+            cat(" WARNING:", divergences, "Divergent transitions found! Results might be biased.\n")
+            all_models_converged <- FALSE; model_converged_current <- FALSE; models_with_divergences <- c(models_with_divergences, model_name)
+        } else { cat(" OK (0 Divergences)\n") }
+    } else { all_models_converged <- FALSE; model_converged_current <- FALSE }
+
+    # 4. Generate and Save Trace Plots Directly using png()
+    cat("  - Saving trace plots to file...")
+    params_all <- variables(model)
+    params_fixed <- grep("^b_", params_all, value = TRUE)
+    params_sd <- grep("^sd_", params_all, value = TRUE)
+    params_to_plot <- intersect(params_all, c(params_fixed, params_sd))
+
+    if (length(params_to_plot) > 0) {
+        plot_filename <- file.path(diag_plot_dir, paste0("traceplot_", model_name, ".png"))
+        # Open the PNG device directly
+        png(filename = plot_filename, width = 1000, height = 200 + length(params_to_plot) * 40, res = 100) # Adjusted size/res
+        # Use tryCatch around the plot generation itself
+        plot_success <- tryCatch({
+            # Generate plot directly to the open PNG device
+             plot(model, type = "trace", variable = params_to_plot, N = length(params_to_plot), ask = FALSE, theme = theme_minimal()) # Added theme
+             TRUE # Return TRUE on success
+        }, warning = function(w){
+             cat(" Warning during trace plot generation for ", model_name, ": ", w$message, "\n")
+             TRUE # Continue even if there's a warning during plotting
+        }, error = function(e) {
+            cat(" Error generating trace plot for ", model_name, ": ", e$message, "\n")
+            FALSE # Return FALSE on error
+        })
+        # IMPORTANT: Always close the device
+        dev.off()
+        # Report success or failure based on tryCatch result
+        if(plot_success) { cat(" Saved trace plot to:", plot_filename, "\n") } else { cat(" Failed to save trace plot:", plot_filename, "\n") }
+    } else {
+        cat(" No fixed effect (b_) or SD (sd_) parameters found to plot traces for.\n")
+    }
+
+    cat("----------------------------------\n")
+
+} # End loop through models
+
+# --- Summarize Overall Checks (same as before) ---
+cat("\n--- Overall Convergence Summary ---\n")
+if (all_models_converged) {
+    cat("SUCCESS: All loaded models passed basic convergence checks (R-hat <", rhat_threshold,
+        ", Neff Ratio >=", neff_ratio_threshold, ", 0 Divergences).\n")
+} else {
+    cat("WARNING: One or more models failed convergence checks or checks could not be performed.\n")
+    if (length(models_with_rhat_issues) > 0) {
+        cat("  - High R-hat values (> ", rhat_threshold, ") found in model(s): ", paste(unique(models_with_rhat_issues), collapse=", "), "\n", sep="")
+    }
+    if (length(models_with_neff_issues) > 0) {
+        cat("  - Low Neff ratios (< ", neff_ratio_threshold, ") found in model(s): ", paste(unique(models_with_neff_issues), collapse=", "), "\n", sep="")
+    }
+    if (length(models_with_divergences) > 0) {
+        cat("  - Divergent transitions found in model(s):", paste(unique(models_with_divergences), collapse=", "), "\n")
+        cat("    -> CAUTION: Divergences indicate potential bias. Consider refitting with adjusted priors or control parameters (e.g., adapt_delta).\n")
+    }
+     cat("  -> Review saved trace plots (in '", diag_plot_dir, "') and model summaries carefully before proceeding.\n", sep="")
+    # stop("Convergence checks failed. Halting execution.") # Uncomment to stop on failure
+}
+cat("\n--- Chunk 11b Finished ---\n")
+```
+
+
+
+```{r}
+# --- NEW: Chunk 12: Compare Fixed Effects Across Models ---
+cat("\n--- Chunk 12: Comparing Fixed Effects Across Models ---\n")
+library(ggplot2)
+library(tidyr) 
+library(stringr)
+
+# Check if models_list exists and has content
+if (!exists("models_list") || length(models_list) == 0) {
+    stop("Models list ('models_list') not found or empty. Run Chunk 11 first.")
+}
+
+all_fixed_effects <- list()
+
+# Loop only through models successfully loaded
+for (model_name in names(models_list)) {
+    model <- models_list[[model_name]]
+    # Add check if fixef can be extracted
+    fixef_summary <- tryCatch({
+         as.data.frame(brms::fixef(model)) %>%
+            rownames_to_column(var = "Parameter") %>%
+            mutate(Model = model_name)
+    }, error = function(e){
+        warning("Could not extract fixef for model '", model_name,"': ", e$message)
+        NULL
+    })
+    if(!is.null(fixef_summary)) {
+        all_fixed_effects[[model_name]] <- fixef_summary
+    }
+}
+
+# Proceed only if we have results from at least one model
+if (length(all_fixed_effects) > 0) {
+    combined_fixef <- bind_rows(all_fixed_effects)
+
+    # Parse parameters (using pattern that includes PCoA axes and scaled predictors)
+    # Determine predictors used from the first available model's formula
+    first_model_formula <- formula(models_list[[1]])$formula
+    fixed_terms <- attr(terms(first_model_formula), "term.labels")
+    # Extract PCoA and scaled predictors from the formula terms
+    predictors_in_formula <- grep("^(PCoA\\d+|.*_scaled)$", fixed_terms, value = TRUE)
+    # Create regex pattern dynamically
+    predictors_regex_part <- paste(predictors_in_formula, collapse="|")
+    params_pattern <- paste0("^mugmmprob([1-7])mean_(", predictors_regex_part, ")$") 
+    cat("Using regex pattern for parsing fixef:", params_pattern, "\n")
+    
+    parsed_fixef <- combined_fixef %>%
+        filter(grepl(params_pattern, Parameter)) %>%
+         mutate(
+            ComponentDpar = str_extract(Parameter, "mugmmprob[1-7]mean"),
+            # Extract predictor using the dynamic regex part
+            Predictor = str_extract(Parameter, paste0("(?<=mean_)(", predictors_regex_part, ")$")), 
+            GMM_Index = brms_dpar_to_gmm_index[ComponentDpar],
+            StrategyName = strategy_names[as.character(GMM_Index)]
+        ) %>%
+        # Order predictors based on formula
+        mutate(Predictor = factor(Predictor, levels = predictors_in_formula)) %>% 
+        mutate(Significant = !(Q2.5 < 0 & Q97.5 > 0)) %>%
+        filter(!is.na(StrategyName) & !is.na(Predictor)) %>%
+        # Order models
+        mutate(Model = factor(Model, levels = intersect(c("Overall", "Oscines", "NonOscines"), names(models_list)))) 
+
+    # Create comparison plot
+    plot_fixef_comparison <- ggplot(parsed_fixef, aes(x = Model, y = Estimate, color = Model)) +
+        geom_hline(yintercept = 0, linetype = "dashed", color = "grey70") +
+        geom_pointrange(aes(ymin = Q2.5, ymax = Q97.5), 
+                        position = position_dodge(width = 0.6), # Adjust dodge width
+                        size=0.5, linewidth=0.8) + # Adjusted size/linewidth
+        facet_grid(StrategyName ~ Predictor, scales = "free_y", switch="y") + # Facet by strategy and predictor, switch y labels
+        scale_color_brewer(palette = "Set1", name = "Model Group") +
+        labs(
+            title = "Comparison of Fixed Effects Across Models",
+            subtitle = paste("Coefficients relative to reference:", reference_strategy_name),
+            x = NULL, # Remove x-axis title
+            y = "Coefficient Estimate (Logit Scale)"
+        ) +
+        theme_bw(base_size = 9) +
+        theme(
+            strip.text = element_text(face = "bold", size=8),
+            strip.background = element_blank(),
+            strip.placement = "outside", # Place strategy names outside
+            axis.text.x = element_blank(), # Remove x-axis text
+            axis.ticks.x = element_blank(), # Remove x-axis ticks
+            axis.text.y = element_text(size=7),
+            legend.position = "bottom",
+            panel.spacing = unit(0.5, "lines")
+        )
+
+    print(plot_fixef_comparison)
+    ggsave(file.path(output_dir, "plot_fixed_effects_comparison.png"), plot_fixef_comparison, width = 10, height = 9, dpi = 300) # Adjust size
+    cat("Saved fixed effects comparison plot.\n")
+
+} else {
+    cat("Skipping fixed effects comparison plot - could not extract effects from any loaded models.\n")
+}
+```
+
+```{r}
+# --- NEW: Chunk 13: Compare Phylogenetic Signal (SDs) Across Models ---
+cat("\n--- Chunk 13: Comparing Phylogenetic Signal (SDs) Across Models ---\n")
+
+# Ensure the models_list exists from the previous chunk
+if (!exists("models_list") || length(models_list) == 0) {
+    stop("Models list ('models_list') not found or empty. Run the preceding chunks first.")
+}
+
+# --- Data Extraction (Unchanged) ---
+all_phylo_sds <- list()
+
+for (model_name in names(models_list)) {
+    model <- models_list[[model_name]]
+    vc <- tryCatch(VarCorr(model), error = function(e) NULL)
+    
+    if (!is.null(vc) && "species" %in% names(vc) && !is.null(vc$species$sd)) {
+        sd_df <- as.data.frame(vc$species$sd) %>%
+            rownames_to_column(var = "Parameter") %>%
+            mutate(Model = model_name)
+
+        sd_param_pattern <- "^mugmmprob([1-7])mean_Intercept$"
+        sd_df_parsed <- sd_df %>%
+            filter(grepl(sd_param_pattern, Parameter)) %>%
+            mutate(
+                ComponentDpar = str_extract(Parameter, "mugmmprob[1-7]mean"),
+                GMM_Index = brms_dpar_to_gmm_index[ComponentDpar],
+                StrategyName = strategy_names[as.character(GMM_Index)]
+            ) %>%
+            filter(!is.na(StrategyName)) %>%
+            dplyr::select(Model, StrategyName, GMM_Index, Estimate, Q2.5, Q97.5)
+        
+        all_phylo_sds[[model_name]] <- sd_df_parsed
+    } else {
+        cat("Could not extract phylogenetic SDs for model:", model_name, "\n")
+    }
+}
+
+# --- Plotting Section (Improved) ---
+if (length(all_phylo_sds) > 0) {
+    combined_phylo_sds <- bind_rows(all_phylo_sds) %>%
+        mutate(Model = factor(Model, levels = intersect(c("Overall", "Oscines", "NonOscines"), names(models_list))))
+
+    # Create the improved comparison plot
+    plot_phylo_sd_comparison <- ggplot(combined_phylo_sds, aes(x = Model, y = Estimate, fill = Model)) +
+        geom_col(position = position_dodge(width = 0.9), width = 0.8, alpha = 0.9) +
+        geom_errorbar(
+            aes(ymin = Q2.5, ymax = Q97.5),
+            position = position_dodge(width = 0.9),
+            width = 0.2,
+            color = "gray20", # Darker color for better visibility
+            linewidth = 0.6
+        ) +
+        facet_wrap(~ reorder(StrategyName, GMM_Index), scales = "fixed", ncol = 4) +
+        scale_fill_viridis_d(option = "D", end = 0.8) + # Use a clean, colorblind-friendly palette
+        labs(
+            x = NULL, # Remove x-axis title as it's redundant
+            y = "Phylogenetic Signal (SD)", # Simplified y-axis label
+            fill = "Model"
+        ) +
+        # A minimal, clean theme with larger fonts for readability
+        theme_minimal(base_size = 18) +
+        theme(
+            strip.text = element_text(face = "bold", size = rel(0.7)),
+            axis.text.x = element_blank(),
+            axis.ticks.x = element_blank(),
+            legend.position = "bottom",
+            panel.spacing = unit(1.5, "lines"), # Increase spacing between facets
+            panel.grid.major.x = element_blank(), # Remove vertical grid lines
+            panel.grid.minor = element_blank(),
+            plot.background = element_rect(fill = "white", color = NA) # Ensure a white background
+        )
+
+    print(plot_phylo_sd_comparison)
+    
+    # Save the plot
+    ggsave(
+        file.path(output_dir, "plot_phylo_sd_comparison_improved.png"),
+        plot_phylo_sd_comparison,
+        width = 12, height = 7, dpi = 600
+    )
+    cat("Saved improved phylogenetic SD comparison plot.\n")
+
+} else {
+    cat("Skipping phylogenetic SD comparison plot - no SDs extracted.\n")
+}
+```
+
+
+
+
+
+
+```{r}
+# --- REVISED AGAIN (v2 - With Credible Intervals): Chunk 15: Calculate Probability Changes ---
+cat("\n--- Chunk 15 (Revised Again v2 - With CIs): Calculating Probability Changes for Lollipop Plots ---\n")
+
+# Ensure necessary objects exist
+if (!exists("models_list") || length(models_list) == 0) {
+    stop("Models list ('models_list') not found or empty. Run Chunk 11 first.")
+}
+if (!exists("response_vars")) { stop("response_vars (GMM column names) not found.") }
+if (!exists("strategy_names")) { stop("strategy_names mapping not found.") }
+
+# --- CONFIGURATION ---
+first_model_data_cols <- names(models_list[[1]]$data)
+predictors_for_lollipop <- grep("^PCoA\\d+$", first_model_data_cols, value = TRUE)
+scaled_preds_in_models <- grep("_scaled$", first_model_data_cols, value = TRUE)
+all_model_predictors <- unique(c(predictors_for_lollipop, scaled_preds_in_models))
+
+quantile_low <- 0.10  
+quantile_high <- 0.90 
+ndraws_lollipop <- 2000
+epsilon <- 1e-9 
+ci_probs <- c(0.025, 0.975) # For 95% Credible Interval
+cat("Using CI quantiles:", paste(ci_probs, collapse=", "), "for relative change.\n")
+# --- END CONFIGURATION ---
+
+if(length(predictors_for_lollipop) == 0) {
+     stop("No PCoA predictors (PCoA1, PCoA2, etc.) found. Cannot calculate lollipop changes.")
+}
+cat("Calculating probability changes between", quantile_low*100,"th and", quantile_high*100,
+    "th percentiles for predictors:", paste(predictors_for_lollipop, collapse=", "), "\n")
+
+all_prob_changes_list <- list()
+
+for (model_name in names(models_list)) {
+    cat(" Processing model:", model_name, "\n")
+    model <- models_list[[model_name]]
+    model_data <- model$data 
+
+    prob_changes_model <- list() 
+
+    for (pred in predictors_for_lollipop) {
+        cat("  Predictor:", pred, "...")
+        
+        if(!pred %in% names(model_data)) { cat(" Skipped (not found in this model's data).\n"); next }
+        pred_vector <- model_data[[pred]]
+        if(all(is.na(pred_vector)) || length(unique(na.omit(pred_vector))) <= 1) { cat(" Skipped (predictor data is NA or constant).\n"); next }
+        
+        pred_quantiles <- quantile(pred_vector, probs = c(quantile_low, quantile_high), na.rm = TRUE)
+        low_val <- pred_quantiles[1]
+        high_val <- pred_quantiles[2]
+        if(abs(low_val - high_val) < epsilon) { cat(" Skipped (predictor quantiles are the same).\n"); next }
+        
+        newdata_pred <- data.frame(row_id = 1:2) 
+        newdata_pred[[pred]] <- c(low_val, high_val)
+        
+        formula_predictors <- all.vars(formula(model)$formula)
+        formula_predictors <- formula_predictors[!grepl("^gmm_prob", formula_predictors)] 
+        formula_predictors <- setdiff(formula_predictors, "species") 
+        
+        other_preds_to_set <- setdiff(formula_predictors, pred)
+        
+        for(other_p in other_preds_to_set) {
+            if(other_p %in% names(model_data)) {
+                if(is.numeric(model_data[[other_p]])) {
+                    newdata_pred[[other_p]] <- mean(model_data[[other_p]], na.rm = TRUE)
+                } else if (is.factor(model_data[[other_p]])) {
+                    tab <- table(model_data[[other_p]])
+                    if(length(tab)>0){
+                       mode_val <- names(tab)[which.max(tab)][1]
+                       newdata_pred[[other_p]] <- factor(mode_val, levels = levels(model_data[[other_p]]))
+                    } else {
+                         warning("Factor '", other_p, "' has no data in model '", model_name, "'. Setting to NA.")
+                         newdata_pred[[other_p]] <- factor(NA, levels = levels(model_data[[other_p]]))
+                    }
+                } else {
+                     newdata_pred[[other_p]] <- NA 
+                }
+            } else {
+                 # warning("Predictor '", other_p, "' from formula not found in data for model '", model_name, "'. Omitting from newdata.")
+            }
+        }
+        newdata_pred$row_id <- NULL 
+        # cat(" newdata created cols:", paste(names(newdata_pred), collapse=", "), "...")
+
+        epred_draws <- tryCatch({
+             posterior_epred(model, newdata = newdata_pred, ndraws = ndraws_lollipop, re_formula=NA, allow_new_levels=TRUE) 
+        }, error = function(e){
+             cat(" posterior_epred failed:", e$message, "\n")
+             NULL
+        })
+
+        if(is.null(epred_draws)) { next } 
+
+        if(length(dim(epred_draws)) != 3 || dim(epred_draws)[2] != 2 || dim(epred_draws)[3] != length(response_vars)) {
+             cat(" posterior_epred returned unexpected dimensions:", paste(dim(epred_draws), collapse="x"), ". Skipping.\n")
+             next
+        }
+        
+        prob_low_draws <- epred_draws[ , 1, ] 
+        prob_high_draws <- epred_draws[ , 2, ] 
+
+        diff_draws <- prob_high_draws - prob_low_draws
+        # Ensure prob_low_draws is a matrix for element-wise division if it became a vector
+        if (!is.matrix(prob_low_draws) && is.vector(prob_low_draws) && length(response_vars) > 1) {
+            prob_low_draws <- matrix(prob_low_draws, nrow = nrow(diff_draws), ncol = ncol(diff_draws), byrow = TRUE)
+        } else if (!is.matrix(prob_low_draws) && length(response_vars) == 1) { # Single response variable
+             prob_low_draws <- matrix(prob_low_draws, ncol = 1)
+        }
+
+
+        rel_change_draws <- diff_draws / (prob_low_draws + epsilon) 
+
+        median_rel_change <- apply(rel_change_draws, 2, median, na.rm = TRUE) 
+        mean_prob_low <- colMeans(prob_low_draws, na.rm = TRUE)
+        mean_prob_high <- colMeans(prob_high_draws, na.rm = TRUE)
+        mean_diff <- colMeans(diff_draws, na.rm = TRUE)
+        
+        # *** NEW: Calculate Credible Intervals for Relative Change ***
+        ci_rel_change_lower <- apply(rel_change_draws, 2, quantile, probs = ci_probs[1], na.rm = TRUE)
+        ci_rel_change_upper <- apply(rel_change_draws, 2, quantile, probs = ci_probs[2], na.rm = TRUE)
+        # *** END NEW ***
+
+        category_names_results <- response_vars
+
+        predictor_results <- tibble(
+            Predictor = pred,
+            CategoryName = category_names_results,
+            ProbLow = mean_prob_low,
+            ProbHigh = mean_prob_high,
+            AbsChange = mean_diff,
+            RelChange = median_rel_change, # This is the point estimate (median)
+            RelChangeLowerCI = ci_rel_change_lower, # New column
+            RelChangeUpperCI = ci_rel_change_upper  # New column
+        )
+        prob_changes_model[[pred]] <- predictor_results
+        cat(" Calculated.\n")
+
+    } 
+    
+    if(length(prob_changes_model)>0){
+        all_prob_changes_list[[model_name]] <- bind_rows(prob_changes_model) %>% mutate(Model = model_name)
+    }
+
+} 
+
+if (length(all_prob_changes_list) > 0) {
+    all_probability_changes <- bind_rows(all_prob_changes_list) %>%
+        mutate(
+            GMM_Index = as.numeric(str_extract(CategoryName, "(?<=gmm_prob_)[0-7]+(?=_mean)")),
+            StrategyName = strategy_names[as.character(GMM_Index)]
+        ) %>%
+        # *** MODIFIED FILTER: ensure CI bounds are finite too ***
+        filter(
+            !is.na(StrategyName) & 
+            is.finite(RelChange) &
+            is.finite(RelChangeLowerCI) &  # New condition
+            is.finite(RelChangeUpperCI)    # New condition
+        ) %>%
+        mutate(
+            Model = factor(Model, levels = intersect(c("Overall", "Oscines", "NonOscines"), names(models_list))),
+            Predictor = factor(Predictor, levels = predictors_for_lollipop)
+        )
+               
+    cat("\n--- Probability change calculations (with CIs) complete. Object 'all_probability_changes' created. ---\n")
+    if(nrow(all_probability_changes) == 0){
+         warning("The 'all_probability_changes' data frame was created but has 0 rows. Lollipop plot will fail.")
+         all_probability_changes <- NULL 
+    } else {
+           print(head(all_probability_changes)) 
+    }
+} else {
+    warning("Probability change calculations failed for all models. 'all_probability_changes' not created.")
+    all_probability_changes <- NULL 
+}
+```
+
+```{r}
+cat("\n--- Chunk 16 (Revised v14 - Points & CIs Only, Fixed Point Size, Y-axis, Titles Above) ---\n")
+
+# Required libraries
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(svglite)
+if (!require(ggtext)) {install.packages("ggtext"); library(ggtext)}
+if (!require(ggh4x)) {install.packages("ggh4x"); library(ggh4x)}
+
+# Check input data
+if (!exists("all_probability_changes") || is.null(all_probability_changes) || nrow(all_probability_changes) == 0) {
+    cat("Input data 'all_probability_changes' not found, is NULL, or empty. Skipping Chunk 16.\n")
+    plot_overall_pcoas_points_cis <- ggplot() + theme_void() + ggtitle("Plot skipped - input data missing")
+} else {
+    # Check for new CI columns from Chunk 15
+    if (!all(c("RelChangeLowerCI", "RelChangeUpperCI") %in% names(all_probability_changes))) {
+        stop("CI columns 'RelChangeLowerCI' and 'RelChangeUpperCI' not found. Re-run Chunk 15.")
+        plot_overall_pcoas_points_cis <- ggplot() + theme_void() + ggtitle("CI data missing. Re-run Chunk 15.")
+    }
+
+    # --- Configuration & Mappings ---
+    biological_strategy_order <- c(
+        "Flat Whistles", "Slow Modulated Whistles", "Fast Modulated Whistles",
+        "Slow Trills", "Fast Trills", "Ultrafast Trills",
+        "Harmonic Stacks", "Noisy Songs"
+    )
+    strategy_abbreviations <- c(
+        "Flat Whistles" = "FW", "Slow Modulated Whistles" = "SMW", "Fast Modulated Whistles" = "FMW",
+        "Slow Trills" = "ST", "Fast Trills" = "FT", "Ultrafast Trills" = "UFT",
+        "Harmonic Stacks" = "HS", "Noisy Songs" = "CN"
+    )
+    strategy_abbreviation_order <- strategy_abbreviations[biological_strategy_order]
+    abbrev_levels_for_axis <- strategy_abbreviation_order
+
+    pcoa_interpretations_full <- c(
+        "PCoA1" = "Communication Network\n(↑ = more distant receivers)",
+        "PCoA2" = "Vocal Tract Morphology\n(↑ = bigger size)",
+        "PCoA3" = "Sexual Selection\n(↑ = stronger selection)"
+    )
+    pcoas_in_data <- character(0)
+    if ("Predictor" %in% names(all_probability_changes)) {
+       pcoas_in_data <- levels(droplevels(factor(all_probability_changes$Predictor)))
+    } else {
+       stop("'Predictor' column not found. Cannot determine PCoAs.")
+    }
+    pcoa_interpretations_plot_orig <- pcoa_interpretations_full[names(pcoa_interpretations_full) %in% pcoas_in_data]
+    pcoas_to_plot <- names(pcoa_interpretations_plot_orig) 
+
+    if (length(pcoas_to_plot) == 0) {
+        stop("No PCoAs to plot. Plotting skipped.")
+        plot_overall_pcoas_points_cis <- ggplot() + theme_void() + ggtitle("No PCoAs to plot.")
+    }
+    if (!"Overall" %in% unique(as.character(all_probability_changes$Model))) {
+        stop("The 'Overall' model is required but not found. Plotting skipped.")
+        plot_overall_pcoas_points_cis <- ggplot() + theme_void() + ggtitle("Data for 'Overall' model not found.")
+    }
+    
+    model_order <- c("Overall") # Plotting only overall model
+
+    if (length(pcoas_to_plot) > 0 && "Overall" %in% unique(as.character(all_probability_changes$Model))) {
+
+        # --- Color Definitions ---
+        custom_palettes <- list()
+        if ("PCoA1" %in% pcoas_to_plot) custom_palettes[["PCoA1"]] <- c("#000000", "#000000", "#000000")
+        if ("PCoA2" %in% pcoas_to_plot) custom_palettes[["PCoA2"]] <- c("#000000", "#000000", "#000000")
+        if ("PCoA3" %in% pcoas_to_plot) custom_palettes[["PCoA3"]] <- c("#000000", "#000000", "#000000")
+        
+        manual_colors_points_cis <- list() # Renamed for clarity
+        overall_model_level_name <- "Overall"
+        for (pcoa in pcoas_to_plot) {
+            pcoa_shades <- custom_palettes[[pcoa]]
+            key_for_map <- paste(pcoa, overall_model_level_name, sep = "_")
+            manual_colors_points_cis[[key_for_map]] <- if (is.null(pcoa_shades) || length(pcoa_shades) == 0) "#000000" else pcoa_shades[1]
+        }
+        manual_colors_points_cis <- unlist(manual_colors_points_cis)
+
+        `%||%` <- function(a, b) if (is.na(a) || is.null(a)) b else a 
+        base_pcoa_title_colors <- c("PCoA1"="#000000", "PCoA2"="#000000", "PCoA3"="#000000")
+        pcoa_facet_title_colors <- setNames(
+            sapply(pcoas_to_plot, function(p) base_pcoa_title_colors[p] %||% "#000000"), pcoas_to_plot
+        )
+
+        # --- Data Preparation for Plotting ---
+        plot_data_points_cis <- all_probability_changes %>% # Renamed for clarity
+            filter(Model == "Overall" & Predictor %in% pcoas_to_plot) %>%
+            mutate(
+                StrategyName_abbreviated = factor(strategy_abbreviations[as.character(StrategyName)], levels = abbrev_levels_for_axis),
+                PercentChange = RelChange * 100,
+                PlottedPercent = ifelse(Predictor == "PCoA3", PercentChange * -1, PercentChange),
+                PlottedPercentLowerCI = ifelse(
+                    Predictor == "PCoA3", RelChangeUpperCI * 100 * -1, RelChangeLowerCI * 100
+                ),
+                PlottedPercentUpperCI = ifelse(
+                    Predictor == "PCoA3", RelChangeLowerCI * 100 * -1, RelChangeUpperCI * 100
+                ),
+                TempLower = pmin(PlottedPercentLowerCI, PlottedPercentUpperCI),
+                TempUpper = pmax(PlottedPercentLowerCI, PlottedPercentUpperCI),
+                PlottedPercentLowerCI = TempLower,
+                PlottedPercentUpperCI = TempUpper,
+                Model_Factor = factor(Model, levels = model_order),
+                PCoA_Interpretation_Original = factor(
+                     pcoa_interpretations_plot_orig[as.character(Predictor)], 
+                     levels = pcoa_interpretations_plot_orig[order(match(names(pcoa_interpretations_plot_orig), pcoas_to_plot))]
+                ),
+                InteractionGroup = interaction(Predictor, Model_Factor, sep = "_", lex.order = TRUE),
+                pcoa_split = stringr::str_split_fixed(as.character(PCoA_Interpretation_Original), "\n", 2),
+                pcoa_title = pcoa_split[,1],
+                pcoa_subtitle = pcoa_split[,2],
+                pcoa_title_color_val = pcoa_facet_title_colors[as.character(Predictor)],
+                PCoA_Formatted = paste0(
+                    "<span style='color:", pcoa_title_color_val, "; font-weight:bold;'>", pcoa_title, "</span>",
+                    "<br>", "<span style='font-size:9pt; color:#444444;'>", pcoa_subtitle, "</span>" 
+                ),
+                PCoA_Formatted = factor(PCoA_Formatted, levels = unique(PCoA_Formatted[order(PCoA_Interpretation_Original)]))
+            ) %>%
+            dplyr::select(-TempLower, -TempUpper) %>%
+            filter(
+                !is.na(StrategyName_abbreviated) & !is.na(PCoA_Formatted) &
+                !is.na(InteractionGroup) & is.finite(PlottedPercent) &
+                is.finite(PlottedPercentLowerCI) & is.finite(PlottedPercentUpperCI)
+            )
+        
+        if (length(manual_colors_points_cis) > 0) {
+            plot_data_points_cis <- plot_data_points_cis %>%
+                filter(InteractionGroup %in% names(manual_colors_points_cis))
+        }
+
+        if(nrow(plot_data_points_cis) == 0) {
+            title_message <- "Plot (v14): No data after preparation (check filters and CI data)"
+            warning(paste(title_message, "- Skipping plot generation."))
+            plot_overall_pcoas_points_cis <- ggplot() + theme_void() + ggtitle(title_message)
+        } else {
+            cat("Prepared data for 'Overall by PCoA, Points & CIs only' plot. Rows:", nrow(plot_data_points_cis), "\n")
+
+            y_min_data <- min(plot_data_points_cis$PlottedPercentLowerCI, plot_data_points_cis$PlottedPercent, na.rm = TRUE)
+            y_max_data <- max(plot_data_points_cis$PlottedPercentUpperCI, plot_data_points_cis$PlottedPercent, na.rm = TRUE)
+            final_y_limits <- NULL
+            if (is.finite(y_min_data) && is.finite(y_max_data)) {
+                y_range <- y_max_data - y_min_data
+                y_buffer <- if (y_range == 0) 5 else y_range * 0.10 
+                final_y_limits <- c(y_min_data - y_buffer, y_max_data + y_buffer)
+                cat("Calculated Y-axis limits:", paste(round(final_y_limits,1), collapse=" to "), "\n")
+            } else {
+                warning("Could not determine finite y-axis limits from data; using default ggplot scaling.")
+            }
+
+            plot_overall_pcoas_points_cis <- ggplot(plot_data_points_cis,
+                                                   aes(x = StrategyName_abbreviated, y = PlottedPercent)) +
+                geom_hline(yintercept = 0, linetype = "dashed", color = "gray60", linewidth = 0.5) +
+                geom_linerange(
+                    aes(ymin = PlottedPercentLowerCI, ymax = PlottedPercentUpperCI, color = InteractionGroup),
+                    linewidth = 0.7, # Can adjust this thickness
+                    alpha = 0.7,     
+                    show.legend = FALSE
+                ) +
+                # *** REMOVED: geom_segment (lollipop stem) ***
+                # geom_segment(aes(x = StrategyName_abbreviated, xend = StrategyName_abbreviated,
+                #                  y = 0, yend = PlottedPercent, color = InteractionGroup),
+                #              linewidth = 0.8, alpha=0.8, show.legend = FALSE) + 
+                geom_point(aes(color = InteractionGroup),
+                           size = 2.5, 
+                           alpha = 0.9, show.legend = FALSE) +
+                
+                ggh4x::facet_wrap2(
+                    ~PCoA_Formatted, ncol = 1, scales = "fixed",
+                    strip.position = "top", axes = "all"
+                ) + 
+                scale_color_manual(values = manual_colors_points_cis) +
+                scale_y_continuous(breaks = scales::pretty_breaks(n=5),
+                                   labels = function(x) sprintf("%+d%%", x),
+                                   name = "Median Relative Change in Probability (%)") +
+                labs(x = NULL) + 
+                theme_minimal(base_size = 11) + 
+                theme(
+                    panel.grid.minor = element_blank(),
+                    panel.grid.major.x = element_blank(), 
+                    panel.grid.major.y = element_line(color="gray90", linewidth = 0.3),
+                    panel.spacing.y = unit(1, "lines"),
+                    axis.text.x = element_text(face = "bold", size=10, angle=45, hjust=1, vjust=1), 
+                    axis.text.y = element_text(size=9), 
+                    axis.title.y = element_text(size=10, margin = margin(r=5)),
+                    strip.text.x = ggtext::element_markdown(size=11, margin = margin(t = 7, b = 7), lineheight = 1.1), 
+                    strip.text.y = element_blank(),
+                    legend.position = "none"
+                )
+            
+            if (!is.null(final_y_limits)) {
+                plot_overall_pcoas_points_cis <- plot_overall_pcoas_points_cis + coord_cartesian(ylim = final_y_limits)
+            }
+
+            print(plot_overall_pcoas_points_cis)
+            
+            if (!exists("output_dir") || is.null(output_dir) || !nzchar(output_dir)) { output_dir <- "." }
+            if (!dir.exists(output_dir)) { dir.create(output_dir, recursive = TRUE) }
+            
+            plot_filename <- "plot_overall_pcoa_points_cis_v14.svg"
+            ggsave(file.path(output_dir, plot_filename),
+                   plot = plot_overall_pcoas_points_cis, width = 3.5, height = 8.5, dpi = 300)
+            cat("Faceted plot (v14 - Points & CIs only) saved as", plot_filename, ".\n")
+        }
+    }
+}
+```
+

@@ -1,0 +1,276 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+# --- Packages ---
+library(readr)
+library(dplyr)
+library(stringr)
+library(tidyr)
+```
+
+
+```{r}
+set.seed(123)
+```
+
+
+```{r}
+# Set working directory to project root (adjust as needed)
+# setwd("path/to/project")
+```
+
+
+```{r}
+# --- Load raw file ---
+dat0 <- read_csv("output/biomes/geographic_model_data_with_biomes.csv",
+                 na = c("", "NA"))
+```
+```{r}
+id_col <- "grid_id"                                # spatial id string
+# SES count columns to model (8 syndromes)
+response_cols <- paste0("ses_count_gt5_", 0:7)
+
+# Sanity check
+stopifnot(id_col %in% names(dat0))
+stopifnot(length(response_cols) == 8)
+```
+
+```{r}
+# --- Parse lon/lat from grid_id ---
+coord_pattern <- "^lon(n?)(\\d+)p.*_lat(n?)(\\d+)p.*$"
+extracted <- str_match(dat0[[id_col]], coord_pattern)
+
+if (any(is.na(extracted[, 1]))) {
+  warning("Some grid_id did not match the lon/lat pattern; those rows will be dropped.")
+}
+
+dat1 <- dat0 %>%
+  mutate(
+    lon = ifelse(extracted[, 2] == "n", -1, 1) * as.numeric(extracted[, 3]),
+    lat = ifelse(extracted[, 4] == "n", -1, 1) * as.numeric(extracted[, 5])
+  )
+```
+
+```{r}
+# --- Keep only rows with valid biome and coordinates ---
+dat2 <- dat1 %>%
+  filter(!is.na(BIOME_NUM), !is.na(lon), !is.na(lat))
+```
+
+```{r}
+# --- Cast the 8 SES count columns to numeric and rename to S1..S8 (ordered by suffix) ---
+# Order response_cols by numeric suffix to preserve 0..7 -> S1..S8 mapping
+ord <- order(as.integer(sub(".*_(\\d+)$", "\\1", response_cols)))
+response_cols <- response_cols[ord]
+
+dat3 <- dat2 %>%
+  mutate(across(all_of(response_cols), ~ suppressWarnings(as.numeric(.)))) %>%
+  rename_with(~ paste0("S", seq_along(response_cols)), all_of(response_cols))
+```
+
+```{r}
+# --- Deduplicate (if any) by lon/lat/biome: average the S* values within a cell ---
+dat4 <- dat3 %>%
+  group_by(lon, lat, BIOME_NUM) %>%
+  summarise(across(starts_with("S"), ~ mean(.x, na.rm = TRUE)), .groups = "drop")
+```
+
+```{r}
+# --- Final tidy 'dat' for the INLA scaffold ---
+dat <- dat4 %>%
+  arrange(lon, lat) %>%
+  mutate(idx = row_number()) %>%   # useful for BYM2
+  relocate(lon, lat, BIOME_NUM, idx)
+
+dat$BIOME_NUM = as.factor(dat$BIOME_NUM)
+
+cat("Rows:", nrow(dat), "\n")
+cat("Biomes:", nlevels(dat$BIOME_NUM), "\n")
+print(table(dat$BIOME_NUM))
+summary(dat[, grep("^S\\d+$", names(dat), value = TRUE)])
+```
+```{r}
+# ---- Prep 'dat' ---------------------------------------------------------------
+library(dplyr); library(stringr)
+
+stopifnot("dat" %in% ls())
+
+# If lon/lat are not present, parse them from grid_id
+if (!all(c("lon","lat") %in% names(dat)) && "grid_id" %in% names(dat)) {
+  coord_pattern <- "^lon(n?)(\\d+)p.*_lat(n?)(\\d+)p.*$"
+  ex <- str_match(dat$grid_id, coord_pattern)
+  if (any(is.na(ex[,1]))) warning("Some grid_id did not match the lon/lat pattern.")
+  dat <- dat %>%
+    mutate(
+      lon = ifelse(ex[,2] == "n", -1, 1) * as.numeric(ex[,3]),
+      lat = ifelse(ex[,4] == "n", -1, 1) * as.numeric(ex[,5])
+    )
+}
+stopifnot(all(c("lon","lat") %in% names(dat)))
+
+# Keep rows with a biome
+biome_col <- if ("BIOME_NUM" %in% names(dat)) "BIOME_NUM" else "BIOME_NAME"
+dat <- dat %>% filter(!is.na(.data[[biome_col]]))
+
+# Biome as factor; sum-to-zero contrasts
+if (biome_col == "BIOME_NUM") {
+  dat <- dat %>% mutate(BIOME_NUM = factor(BIOME_NUM))
+} else {
+  dat <- dat %>% mutate(BIOME_NUM = factor(BIOME_NAME))
+}
+options(contrasts = c("contr.sum","contr.poly"))
+
+# Area weights (cell area ~ cos(latitude))
+dat <- dat %>% mutate(w = cos(pi/180 * lat))
+
+# Response columns: accept S1..S8 or ses_count_gt5_0..7
+ses_cols  <- grep("^ses_count_gt5_\\d+$", names(dat), value = TRUE)
+S_cols    <- grep("^S\\d+$",                 names(dat), value = TRUE)
+syndrome_cols <- if (length(S_cols)) S_cols else ses_cols
+stopifnot(length(syndrome_cols) > 0)
+
+cat("Rows:", nrow(dat), "\n")
+cat("Biomes:", nlevels(dat$BIOME_NUM), "\n")
+print(table(dat$BIOME_NUM))
+```
+
+```{r}
+# ---- Mesh + SPDE + A + neighbors --------------------------------------------
+library(INLA)
+library(spdep)
+
+set.seed(1)
+
+coords <- as.matrix(dat[, c("lon","lat")])
+
+# Mesh & SPDE
+mesh <- inla.mesh.2d(
+  loc = coords,
+  max.edge = c(2, 4),
+  offset   = c(1, 2),
+  cutoff   = 0.5
+)
+
+spde <- inla.spde2.pcmatern(
+  mesh = mesh,
+  prior.range = c(5, 0.01),   # P(range < 5°) = 0.01
+  prior.sigma = c(0.5, 0.01)  # P(sigma > 0.5) = 0.01
+)
+
+# Projection matrix for THIS dat
+A <- inla.spde.make.A(mesh = mesh, loc = coords)
+
+# KNN(8) neighbors for Moran's I
+nb_obj   <- knn2nb(knearneigh(coords, k = 8))
+listw_obj <- nb2listw(nb_obj, style = "W", zero.policy = TRUE)
+```
+
+```{r}
+# ---- Compare baseline vs +biome per response ---------------------------------
+library(purrr); library(tibble)
+
+pretty_lab <- function(x) sub("^ses_count_gt5_(\\d+)$", "S\\1", x)
+
+# INLA numerical controls
+CTRL_PRED <- list(compute = TRUE) # A is passed via stack each time
+CTRL_COMP <- list(dic = TRUE, waic = TRUE, cpo = TRUE, config = TRUE)
+CTRL_INLA <- list(strategy = "adaptive", int.strategy = "eb", diagonal = 100)
+
+fit_one <- function(ycol) {
+  y_all <- dat[[ycol]]
+  # allow NA per-response; metrics computed on non-missing subset
+  mask <- is.finite(y_all)
+
+  stk <- inla.stack(
+    data    = list(y = y_all),
+    A       = list(A, 1),
+    effects = list(
+      s = 1:spde$n.spde,
+      list(Intercept = 1, BIOME_NUM = dat$BIOME_NUM)
+    ),
+    tag = "est"
+  )
+
+  f0 <- y ~ -1 + Intercept + f(s, model = spde)
+  m0 <- inla(
+    f0, family = "gaussian",
+    data = inla.stack.data(stk),
+    control.predictor = c(list(A = inla.stack.A(stk)), CTRL_PRED),
+    control.compute   = CTRL_COMP,
+    control.inla      = CTRL_INLA,
+    weights = dat$w,
+    verbose = FALSE
+  )
+
+  f1 <- y ~ -1 + Intercept + BIOME_NUM + f(s, model = spde)
+  m1 <- inla(
+    f1, family = "gaussian",
+    data = inla.stack.data(stk),
+    control.predictor = c(list(A = inla.stack.A(stk)), CTRL_PRED),
+    control.compute   = CTRL_COMP,
+    control.inla      = CTRL_INLA,
+    weights = dat$w,
+    verbose = FALSE
+  )
+
+  idx <- inla.stack.index(stk, "est")$data
+  yhat0 <- m0$summary.fitted.values$mean[idx][mask]
+  yhat1 <- m1$summary.fitted.values$mean[idx][mask]
+  y     <- y_all[mask]
+  w     <- dat$w[mask]
+
+  # area-weighted pseudo-R2
+  r2_w <- function(obs, pred, w) {
+    rss <- sum(w * (obs - pred)^2)
+    muw <- sum(w * obs) / sum(w)
+    tss <- sum(w * (obs - muw)^2)
+    1 - rss/tss
+  }
+  R2_0 <- r2_w(y, yhat0, w)
+  R2_1 <- r2_w(y, yhat1, w)
+
+  # Residual Moran's I on the non-missing subset
+  coords_sub <- coords[mask, , drop = FALSE]
+  nb_sub     <- knn2nb(knearneigh(coords_sub, k = 8))
+  lw_sub     <- nb2listw(nb_sub, style = "W", zero.policy = TRUE)
+  mr0 <- moran.test(y - yhat0, lw_sub, zero.policy = TRUE)
+  mr1 <- moran.test(y - yhat1, lw_sub, zero.policy = TRUE)
+
+  tibble(
+    syndrome   = pretty_lab(ycol),
+    WAIC_0     = m0$waic$waic,
+    WAIC_1     = m1$waic$waic,
+    DIC_0      = m0$dic$dic,
+    DIC_1      = m1$dic$dic,
+    LCPO_0     = -sum(log(pmax(m0$cpo$cpo[idx][mask], .Machine$double.eps)), na.rm = TRUE),
+    LCPO_1     = -sum(log(pmax(m1$cpo$cpo[idx][mask], .Machine$double.eps)), na.rm = TRUE),
+    R2_0       = R2_0,
+    R2_1       = R2_1,
+    dWAIC      = WAIC_0 - WAIC_1,     # >0 means adding biome helps
+    dLCPO      = LCPO_0 - LCPO_1,     # >0 means adding biome helps
+    dR2        = R2_1 - R2_0,         # >0 means adding biome helps
+    MoranI_0   = as.numeric(mr0$estimate[1]),
+    MoranI_1   = as.numeric(mr1$estimate[1]),
+    p_Moran_0  = as.numeric(mr0$p.value),
+    p_Moran_1  = as.numeric(mr1$p.value)
+  )
+}
+
+results <- map_dfr(syndrome_cols, fit_one) %>%
+  mutate(
+    rank_dWAIC = rank(-dWAIC, ties.method = "average"),
+    rank_dLCPO = rank(-dLCPO, ties.method = "average"),
+    rank_dR2   = rank(-dR2,   ties.method = "average"),
+    rank_mean  = (rank_dWAIC + rank_dLCPO) / 2
+  ) %>%
+  arrange(rank_mean)
+
+print(results)
+```
+
+
+
+
