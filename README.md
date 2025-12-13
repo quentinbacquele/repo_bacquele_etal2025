@@ -16,24 +16,49 @@ Explore the global vocal repertoire of passerines: [acoustic-biogeography.vercel
 
 ```
 repo_bacquele_etal2025/
-├── data/                    # Acoustic feature data (not included - see Data Availability)
-├── mps/                     # Modulation Power Spectrum extraction
-├── hypervolume/             # Acoustic space construction and motif clustering
-├── phylogeny/               # Phylogenetic analyses
-├── geo models/              # Spatial regression models
-├── maps/                    # Global mapping visualizations
-└── species level model/     # Species-level trait analyses
+├── data/                           # Acoustic feature data and phylogenetic trees
+│   ├── AllBirdsEricson1.tre        # Source phylogenetic trees (1000 trees)
+│   ├── consensus_sumtrees.tre      # Majority-rule consensus tree
+│   ├── traits_data.csv             # Raw acoustic traits per vocalization
+│   ├── traits_data_pc_gmm_8components_proba.csv  # GMM cluster probabilities
+│   ├── species_traits_data.csv     # Species-level acoustic traits
+│   ├── model_traits_data.csv       # Traits data for modeling
+│   ├── model_traits_morpho_social_data.csv  # Morphological and social traits
+│   ├── grid_species_lists.csv      # Species occurrence per grid cell
+│   ├── grid_1.0deg_species_lists.csv  # Species lists at 1° resolution
+│   ├── grid_1.0deg_coordID.gpkg    # Grid cell geometries
+│   ├── geographic_model_data_with_biomes.csv  # Geographic data with biome info
+│   ├── combined_tei_and_environmental_data.csv  # TEI and environmental variables
+│   ├── ses_fdis_random_assembly_results_full.csv  # SES-FDis null model results
+│   ├── spatial_mpd.csv             # Mean Pairwise Distance results
+│   ├── matching_final_corrected.csv  # Taxonomy matching table
+│   └── unique_families.txt         # List of passerine families
+│
+└── scripts/                        # Analysis scripts
+    ├── data_parser/                # Data extraction utilities
+    ├── mps/                        # Modulation Power Spectrum extraction
+    ├── hypervolume/                # Acoustic space construction and motif clustering
+    ├── phylogeny/                  # Phylogenetic analyses
+    ├── geo models/                 # Spatial regression models
+    ├── maps/                       # Global mapping visualizations
+    └── species level model/        # Species-level trait analyses
 ```
 
-## Folders and Files
+## Scripts
 
-### `mps/` - Modulation Power Spectrum Extraction
+### `scripts/data_parser/` - Data Extraction Utilities
+
+| File | Description |
+|------|-------------|
+| `xeno_canto_extractor.py` | Extracts and processes metadata from xeno-canto recordings. Handles taxonomy matching, data cleaning, and preparation of acoustic datasets for analysis. |
+
+### `scripts/mps/` - Modulation Power Spectrum Extraction
 
 | File | Description |
 |------|-------------|
 | `extract_mps.py` | Computes Modulation Power Spectra (MPS) from audio recordings. MPS quantifies spectro-temporal modulations encoding information such as species identity, individual identity, and singer quality. Uses a 500 ms window with 67% overlap and 2D Fast Fourier Transform. |
 
-### `hypervolume/` - Acoustic Space and Motif Clustering
+### `scripts/hypervolume/` - Acoustic Space and Motif Clustering
 
 | File | Description |
 |------|-------------|
@@ -42,7 +67,7 @@ repo_bacquele_etal2025/
 | `dendogram.py` | Computes and visualizes Euclidean distances between acoustic motif clusters in the 37-PC space. |
 | `species_cluster_distance_analysis.py` | Analyzes species-level acoustic motif usage patterns, including specialization indices and motif diversity per species. |
 
-### `phylogeny/` - Phylogenetic Analyses
+### `scripts/phylogeny/` - Phylogenetic Analyses
 
 | File | Description |
 |------|-------------|
@@ -50,7 +75,7 @@ repo_bacquele_etal2025/
 | `phylo_signals.R` | Calculates phylogenetic signal (Pagel's Lambda, Blomberg's K) for acoustic motif usage. Compares signals between oscine and suboscine passerines. |
 | `tree_refined.R` | Reconstructs ancestral states for dominant acoustic motifs and generates the circular phylogram visualization (Fig. 2A). |
 
-### `geo models/` - Spatial Regression Models
+### `scripts/geo models/` - Spatial Regression Models
 
 | File | Description |
 |------|-------------|
@@ -58,7 +83,7 @@ repo_bacquele_etal2025/
 | `fdis_geo_models_new.Rmd` | Spatial regression models for Functional Dispersion (FDis) of acoustic traits within species assemblages. |
 | `Biomes_congruence.Rmd` | Tests alignment between acoustic motif distributions and terrestrial biome boundaries. Compares baseline spatial models with biome-effect models using WAIC and LCPO. |
 
-### `maps/` - Global Mapping
+### `scripts/maps/` - Global Mapping
 
 | File | Description |
 |------|-------------|
@@ -66,7 +91,7 @@ repo_bacquele_etal2025/
 | `SES_maps.py` | Computes and maps Standardized Effect Sizes (SES) for motif prevalence using realm-constrained null models. Identifies over/under-representation of each acoustic motif relative to species richness. |
 | `dominant_strategy_map.py` | Maps the dominant (most over-represented) acoustic motif per grid cell based on rank-normalized assemblage profiles. |
 
-### `species level model/` - Species-Level Analyses
+### `scripts/species level model/` - Species-Level Analyses
 
 | File | Description |
 |------|-------------|
@@ -89,7 +114,13 @@ The study identifies eight fundamental acoustic motifs that structure passerine 
 
 Acoustic data were acquired from [xeno-canto](https://xeno-canto.org/). The processed acoustic features and metadata are archived at Zenodo (DOI: 10.5281/zenodo.XXXXXXX).
 
-**Note:** The `data/` folder containing the acoustic feature matrices (`X_500ms.npy`, `metadata_500ms.npz`) is not included in this repository due to file size limitations. These files are available upon request or via Zenodo.
+The `data/` folder contains:
+- **Phylogenetic trees**: Source trees (`AllBirdsEricson1.tre`) and consensus tree (`consensus_sumtrees.tre`)
+- **Acoustic traits**: Raw traits per vocalization (`traits_data.csv`), GMM cluster probabilities (`traits_data_pc_gmm_8components_proba.csv`), and species-level summaries
+- **Geographic data**: Species occurrence grids, environmental variables, and biome classifications
+- **Model outputs**: SES-FDis results, spatial MPD calculations
+
+**Note:** Raw audio files and the full acoustic feature matrices (`X_500ms.npy`, `metadata_500ms.npz`) are not included due to file size limitations. These files are available upon request or via Zenodo.
 
 ## Requirements
 
