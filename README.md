@@ -171,7 +171,7 @@ The `data/` folder contains:
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+Creative Commons Attribution 4.0 International.
 
 ## Acknowledgements
 
